@@ -25,10 +25,6 @@
 | --- | --- |
 | ![浅色主题](docs/screenshots/ui-light.png) | ![深色主题](docs/screenshots/ui-dark.png) |
 
-![程序列表与真实图标](docs/screenshots/ui-programs.png)
-![选中程序限速详情](docs/screenshots/ui-detail.png)
-![流量曲线区特写](docs/screenshots/ui-graph-light.png)
-
 ## 🏗️ 架构
 
 ```
