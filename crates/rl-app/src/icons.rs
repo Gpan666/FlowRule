@@ -8,6 +8,11 @@
 //!
 //! 已用 Python ctypes 原型验证过整条链路（notepad / explorer / cmd 图标均正确、
 //! 透明背景干净），这里是等价的 Rust 实现。
+//!
+//! 非 Windows 目标（CI 上跑 rl-app 单测）只保留声明、不链接、不实现。
+
+// Windows 的 Shell / GDI 类型与常量，非 Windows 上无人使用
+#![allow(dead_code)]
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
@@ -67,7 +72,9 @@ struct BitmapInfo {
     bmi_colors: [u32; 3],
 }
 
-#[link(name = "shell32")]
+// `link(name = …)` 只在真正的 Windows 目标上生效。非 Windows（CI 上跑 rl-app 单测）
+// 保留声明但不链接，编译器不会真去解析这些符号。
+#[cfg_attr(windows, link(name = "shell32"))]
 extern "system" {
     fn SHGetFileInfoW(
         psz_path: *const u16,
@@ -78,13 +85,13 @@ extern "system" {
     ) -> isize;
 }
 
-#[link(name = "user32")]
+#[cfg_attr(windows, link(name = "user32"))]
 extern "system" {
     fn GetIconInfo(h_icon: isize, p_icon_info: *mut IconInfo) -> i32;
     fn DestroyIcon(h_icon: isize) -> i32;
 }
 
-#[link(name = "gdi32")]
+#[cfg_attr(windows, link(name = "gdi32"))]
 extern "system" {
     fn GetObjectW(handle: isize, count: i32, data: *mut u8) -> i32;
     fn CreateCompatibleDC(hdc: isize) -> isize;
@@ -102,6 +109,14 @@ extern "system" {
 }
 
 /// 返回 PNG 的 base64（不含 `data:image/png;base64,` 前缀）；取不到图标返回 `None`。
+#[cfg(not(windows))]
+pub fn exe_icon_base64(path: &str) -> Option<String> {
+    // 非 Windows（CI 上跑单测）没有 Shell/GDI，直接当作取不到图标
+    let _ = path;
+    None
+}
+
+#[cfg(windows)]
 pub fn exe_icon_base64(path: &str) -> Option<String> {
     if path.is_empty() || !Path::new(path).exists() {
         return None;
@@ -125,6 +140,7 @@ pub fn exe_icon_base64(path: &str) -> Option<String> {
     png
 }
 
+#[cfg(windows)]
 unsafe fn icon_to_png(h_icon: isize) -> Option<String> {
     let mut ii: IconInfo = mem::zeroed();
     if GetIconInfo(h_icon, &mut ii) == 0 {

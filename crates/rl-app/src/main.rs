@@ -23,7 +23,7 @@ mod settings;
 /// 当前进程是否已提权（UAC 过滤令牌下返回 false，完全提权返回 true）
 #[cfg(windows)]
 fn is_elevated() -> bool {
-    #[link(name = "shell32")]
+    #[cfg_attr(windows, link(name = "shell32"))]
     extern "system" {
         fn IsUserAnAdmin() -> i32;
     }
@@ -42,8 +42,16 @@ use rl_core::{
 };
 use rl_engine_win::{StatKey, StatsMap, WinDivertEngine};
 
-/// 引擎一轮最多处理多少个包
-const POLL_BATCH: usize = 256;
+/// 引擎一轮最多处理多少个包。
+///
+/// ⚠️ 这个值直接决定**能被限住的最高带宽**：后台线程每轮 `poll` 之后固定睡 1ms，
+/// 于是「每毫秒最多 POLL_BATCH 个包」。1500 字节 / 包时：
+///   256 包 → ≈384 MB/s   512 → ≈768 MB/s   1024 → ≈1.5 GB/s
+/// 早期是 256（≈384 MB/s），千兆满速下载就已逼近上限 —— 一旦实例带宽超过它，
+/// 限速对「高速程序」就失去区分度（用户看到的就是「限速没效果」）。
+/// 排空队列的循环在队列空时立刻退出，加大预算不会拖慢空转，
+/// 所以这里取 1024，把理论上限抬到 1.5 GB/s。
+const POLL_BATCH: usize = 1024;
 /// 进程列表刷新间隔
 const SCAN_INTERVAL: Duration = Duration::from_secs(3);
 /// 发给前端的曲线点数（内部 600 点降采样）

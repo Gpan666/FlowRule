@@ -11,3 +11,10 @@ rl-core = { path = "../rl-core" }
 # 运行时动态加载 WinDivert.dll，不链接 MSVC 的 .lib：
 # 好处是免管理员装 MSVC 生成工具、GNU 工具链也能编译，且缺驱动时优雅降级。
 libloading = "0.8"
+
+# 引擎里的 Win32 声明（CreateEventW / WinDivert 函数指针等）是 windows-only 的，
+# 所以 lib 目标只在 Windows 上产出。纯逻辑单测走 tests/logic.rs：它用 #[path]
+# 把 src/lib.rs 当模块编进测试二进制，任何机器/CI 都能跑，不需要 Windows 和驱动。
+[[test]]
+name = "logic"
+path = "tests/logic.rs"

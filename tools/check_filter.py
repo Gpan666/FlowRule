@@ -79,7 +79,9 @@ def main():
         print("[PASS] WINDIVERT_ADDRESS = 80 字节")
 
     # 4) 反例自检：确认 DLL 确实会拒绝 processId（保证这个校验有判别力）
-    bad = "inbound and ip and (tcp or udp) and not loopback and (processId == 4242)"
+    #    注意：这里的「合法部分」必须用引擎当前真实的 filter 语义（not ifIdx != 1），
+    #    否则反例可能因为别的语法问题被拒绝，看不出 processId 本身非法。
+    bad = "inbound and (ip or ipv6) and (tcp or udp) and not ifIdx != 1 and (processId == 4242)"
     ok, msg, pos = compile_ok(bad)
     if ok:
         failures.append("反例自检失败：含 processId 的 filter 竟然编译通过，校验失去意义")

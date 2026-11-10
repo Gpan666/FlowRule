@@ -10,7 +10,8 @@
 //! 因此本引擎不再给每个程序开句柄，而是：
 //!
 //! 1. **每方向只开 1 个全局句柄**，filter 用 `Direction::base_filter()`
-//!    （`inbound/outbound and ip and (tcp or udp) and not loopback`，不含 processId）；
+//!    （`inbound/outbound and (ip or ipv6) and (tcp or udp) and not ifIdx != 1 ...`，
+//!    不含 processId；跳过软件回环口，避免 VPN/代理中转时同一个包被限两次）；
 //! 2. 收到包后解析 IPv4 + TCP/UDP 头得到五元组；
 //! 3. 用 [`proc_map::ProcMap`]（GetExtendedTcpTable/UdpTable owner-pid）查到 owning PID；
 //! 4. 按 [`LimitConfig`] 把 PID 映射到程序 key，选出该程序的令牌桶；未匹配则走
@@ -80,7 +81,7 @@ struct Overlapped {
     h_event: Handle,
 }
 
-#[link(name = "kernel32")]
+#[cfg_attr(windows, link(name = "kernel32"))]
 extern "system" {
     fn CreateEventW(
         attributes: *mut std::ffi::c_void,
