@@ -958,3 +958,84 @@ fn main() {
             }
         });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构造一个「只对某个程序限速」的状态：总开关开、程序规则 20 MB/s、
+    /// 「其他流量」保持默认（未启用）。
+    fn inner_with_single_program_limit() -> Inner {
+        let mut g = Inner::new();
+        g.unit = Unit::Mb;
+        g.master = true;
+
+        let key = "c:\\adu.exe".to_string();
+        g.programs = vec![ProgramInfo {
+            key: key.clone(),
+            name: "ADU.exe".to_string(),
+            path: Some("C:\\ADU.exe".to_string()),
+            pids: vec![4242],
+        }];
+
+        let mut rule = RuleState::new();
+        rule.down = DirState { enabled: true, sel: Sel::Custom, custom: "20".to_string() };
+        g.rules.insert(key, rule);
+        g
+    }
+
+    /// 核心不变量：**只限某个程序时，下发给引擎的配置里绝不能出现「其他流量」桶。**
+    ///
+    /// 这条一旦被破坏，引擎就会给「所有未识别归属的流量」套上兜底限速，
+    /// 表现为「单限某程序却整台电脑被限」「设 20MB 实测只有 1MB」。
+    #[test]
+    fn single_program_limit_never_creates_global_other_bucket() {
+        let g = inner_with_single_program_limit();
+        let cfg = g.current_config();
+
+        assert_eq!(cfg.other_down_bps, 0, "「其他流量」下行必须是 0（不限速）");
+        assert_eq!(cfg.other_up_bps, 0, "「其他流量」上行必须是 0（不限速）");
+        assert!(!cfg.other_active(), "不应存在「其他流量」桶");
+
+        assert_eq!(cfg.rules.len(), 1);
+        let r = &cfg.rules[0];
+        assert_eq!(r.key, "c:\\adu.exe");
+        assert_eq!(r.down_bps, 20 * 1024 * 1024, "20 MB/s 应为 20971520 字节/秒");
+        assert_eq!(r.up_bps, 0);
+        assert_eq!(r.pids, vec![4242]);
+    }
+
+    /// 只点总开关（不设任何规则）→ 不接管任何流量，更不能产生全局桶。
+    #[test]
+    fn master_alone_creates_no_buckets() {
+        let mut g = Inner::new();
+        g.master = true;
+        let cfg = g.current_config();
+        assert!(cfg.is_all_unlimited(), "只开总开关不应产生任何限速");
+        assert!(cfg.rules.is_empty());
+        assert_eq!(cfg.other_down_bps, 0);
+        assert_eq!(cfg.other_up_bps, 0);
+    }
+
+    /// 总开关关闭 → 引擎拿到 unlimited，不接管流量。
+    #[test]
+    fn master_off_disables_everything() {
+        let mut g = inner_with_single_program_limit();
+        g.master = false;
+        let cfg = g.current_config();
+        assert!(cfg.is_all_unlimited());
+    }
+
+    /// 用户主动在「其他流量」上设限 → 必须真的产生全局桶（这个能力要保留）。
+    #[test]
+    fn explicit_other_traffic_limit_still_works() {
+        let mut g = inner_with_single_program_limit();
+        g.other.down = DirState { enabled: true, sel: Sel::Profile(5), custom: "1".to_string() };
+        let cfg = g.current_config();
+        assert!(cfg.other_active(), "显式设置「其他流量」应产生全局桶");
+        assert!(cfg.other_down_bps > 0);
+        // 程序规则不受影响
+        assert_eq!(cfg.rules.len(), 1);
+        assert_eq!(cfg.rules[0].down_bps, 20 * 1024 * 1024);
+    }
+}

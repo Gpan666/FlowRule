@@ -31,22 +31,17 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub const VERSION: u32 = 3;
+    pub const VERSION: u32 = 4;
 
     pub fn load() -> Self {
         if let Some(path) = settings_path() {
             if let Ok(text) = std::fs::read_to_string(&path) {
                 if let Ok(mut s) = serde_json::from_str::<Settings>(&text) {
-                    // v1/v2 里「其他流量」频繁被系统自动塞入限速（点总开关、无任何程序规则时
-                    // 自动套 1 MB/s 默认挡位），表现就是「整台电脑被限」——正是用户报告的 bug。
-                    // 升级时：只要「其他流量」被启用但却没有任何程序规则，就视为遗留自动默认，
-                    // 一律清除（v3 起「其他流量」默认不限速）。若用户确实单独设置过某程序，
-                    // 则原样保留其配置。用户若本就想限「其他流量」，重新点一下即可（2 秒）。
-                    if s.version < Self::VERSION {
-                        if (s.other.down.enabled || s.other.up.enabled) && s.rules.is_empty() {
-                            s.other = SavedRule::default();
-                        }
-                        s.version = Self::VERSION;
+                    let migrated = s.version < Self::VERSION;
+                    if migrated {
+                        Self::migrate(&mut s);
+                        // 立刻把清理后的配置落盘，避免下次启动又读到旧的「其他流量」限速
+                        s.save();
                         return s;
                     }
                     if s.version == Self::VERSION {
@@ -56,6 +51,32 @@ impl Settings {
             }
         }
         Settings::default()
+    }
+
+    /// 把旧版本遗留的配置升级到当前版本。
+    ///
+    /// # 关键修复（v4）
+    /// 旧版（v1/v2/v3）有个「点总开关 / 单限程序时自动给『其他流量』套 1 MB/s 默认挡位」
+    /// 的逻辑，它把**未识别归属的流量**（含 IPv6、连接表刷新窗口、本机其它程序）全压到 1 MB/s，
+    /// 表现就是「单限某程序却整台电脑被限」「设 20MB 实测只有 1MB」——用户报的 bug。
+    ///
+    /// 旧迁移（`rules.is_empty()` 守卫）漏掉了「既有程序规则、又有遗留『其他流量』」这种真实场景，
+    /// 于是这个 1 MB 默认挡位被原样存成 v3 保留下来。
+    ///
+    /// 新规则：**任何 < v4 的配置，只要『其他流量』处于启用状态且没有用户输入过自定义速率
+    /// （即没有 `custom` 文本），就一律视为遗留自动默认并清除**。这样：
+    /// - 遗留自动默认（enabled + 默认挡位 + 无 custom）→ 清除 ✓
+    /// - 用户手动点挡位但没打字（gear 选择）→ 也清除（2 秒可重设，可接受）
+    /// - 用户**真的输入过自定义速率**（custom 非空）→ 视为明确意图，保留 ✓
+    /// - 已经手动开启过『其他流量』做全局限速的用户，重设一次即可，不会整台被偷偷限。
+    fn migrate(s: &mut Settings) {
+        if s.version < Self::VERSION {
+            let has_custom = !s.other.down.custom.is_empty() || !s.other.up.custom.is_empty();
+            if (s.other.down.enabled || s.other.up.enabled) && !has_custom {
+                s.other = SavedRule::default();
+            }
+            s.version = Self::VERSION;
+        }
     }
 
     pub fn save(&self) {
@@ -75,4 +96,58 @@ pub fn settings_path() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
         .and_then(|e| e.parent().map(|p| p.join("config").join("settings.json")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn legacy_other(down_p: &str, up_p: &str, rules: usize) -> Settings {
+        let mut s = Settings {
+            version: 2,
+            unit: "kb".into(),
+            master: true,
+            other: SavedRule {
+                down: SavedDir { enabled: true, sel: down_p.into(), custom: String::new() },
+                up: SavedDir { enabled: !up_p.is_empty(), sel: up_p.into(), custom: String::new() },
+            },
+            rules: vec![],
+            selected: None,
+        };
+        for i in 0..rules {
+            s.rules.push((format!("prog{i}"), SavedRule::default()));
+        }
+        s
+    }
+
+    #[test]
+    fn migrate_clears_legacy_other_even_with_program_rules() {
+        // 用户真实场景：旧版自动给「其他流量」套了 1MB，后来又加了程序规则。
+        // 旧迁移（rules.is_empty 守卫）漏掉这种情况，本测试锁定新行为：必须清除。
+        let mut s = legacy_other("p5", "", 1);
+        Settings::migrate(&mut s);
+        assert_eq!(s.version, Settings::VERSION);
+        assert!(!s.other.down.enabled);
+        assert!(!s.other.up.enabled);
+        assert_eq!(s.rules.len(), 1); // 程序规则原样保留
+    }
+
+    #[test]
+    fn migrate_clears_legacy_other_without_rules() {
+        let mut s = legacy_other("p5", "", 0);
+        Settings::migrate(&mut s);
+        assert!(!s.other.down.enabled);
+        assert!(!s.other.up.enabled);
+    }
+
+    #[test]
+    fn migrate_preserves_user_typed_custom_other() {
+        // 用户真的输入过自定义速率（custom 非空）→ 视为明确意图，保留
+        let mut s = legacy_other("custom", "", 0);
+        s.other.down.custom = "20".into();
+        Settings::migrate(&mut s);
+        assert_eq!(s.version, Settings::VERSION);
+        assert!(s.other.down.enabled);
+        assert_eq!(s.other.down.custom, "20");
+    }
 }

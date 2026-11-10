@@ -665,3 +665,65 @@ OK   processId == 4242                layer=2 (FLOW) 才通过
   - 只限某程序 20MB/s → 程序桶 20971520、其他流量 bytes=0 PASS。
 - 隔离目录迁移实测：v2 遗留 → v3 且 other 全清，PASS。
 - 本机仍非管理员，**真实降速未实测**；靠诊断行让用户确认「句柄 2/2 / 丢弃在涨」。
+
+## 15. 「还是老问题」——遗留「其他流量」1MB 没被迁移清除（2026-11-10 21:10）
+
+用户反馈第 14 节的修复「还是老问题」：单限某个程序仍整台电脑被限，设 20MB/s 实测只有 1MB/s。
+
+### 15.1 上一轮为什么没修好
+第 14 节修的是**运行时**逻辑（删掉 `other_auto` 自动兜底），确实有效——但**用户磁盘上
+还留着旧配置**。旧版（v1/v2）点总开关时自动塞进「其他流量」1 MB/s，用户随后又加了
+程序规则，落盘配置变成：
+
+```json
+{ "version": 2,
+  "other": { "down": {"enabled": true, "sel": "p5", "custom": ""} },   // 遗留自动默认
+  "rules": [ ["C:\ADU.exe", {...custom 20...}] ] }                      // 用户自己的规则
+```
+
+而第 14 节写的迁移带 `s.rules.is_empty()` 守卫——「有程序规则就不清除」，
+**正好漏掉用户真实场景**（既有程序规则、又有遗留「其他流量」）→ 那个 1 MB 兜底桶
+被原样存成 v3 继续生效 → 症状与第 13 节一模一样。
+**教训：配置迁移的守卫条件必须按「用户真实操作序列」推导，而不是按「干净配置」推导。**
+
+### 15.2 修复：v4 迁移，无条件清除遗留「其他流量」
+- `Settings::VERSION` 3 → 4；`load()` 对任何 < v4 的配置：
+  **只要「其他流量」处于启用状态且用户没有输入过自定义速率（custom 为空），
+  一律清除 `other`**。这样同时覆盖：
+  - 遗留自动默认（enabled + 默认挡位 + 无 custom）→ 清除 ✓
+  - 用户手动点挡位但没打字 → 也清除（2 秒可重设，可接受）
+  - 用户**真的输入过自定义速率**（custom 非空）→ 视为明确意图，**保留** ✓
+- 迁移后**立即 `save()` 落盘**，避免下次启动又读到旧值。
+- 旧迁移（`rules.is_empty()` 守卫）整体废弃。
+
+### 15.3 回归防线（新增）
+- `settings.rs` 3 个单测：有程序规则也要清除 / 无规则也要清除 / 自定义速率要保留。
+- `main.rs` 4 个**不变量单测**（直接断言下发给引擎的 `LimitConfig`）：
+  - `single_program_limit_never_creates_global_other_bucket`（核心）
+  - `master_alone_creates_no_buckets`
+  - `master_off_disables_everything`
+  - `explicit_other_traffic_limit_still_works`（保证「其他流量」能力没被误伤）
+- `tools/verify_migration.mjs`：**真·端到端**——写一份 v2 遗留配置 → 启动真 exe →
+  断言落盘结果为 v4 / other 全禁用 / 程序规则原样保留。
+
+### 15.4 工具踩坑（WebView2 157.x 不再理会环境变量）
+- 本机 Edge WebView2 157.0.4341.42 **忽略 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`**
+  （浏览器进程命令行里根本没有 `--remote-debugging-port`），
+  且 Tauri v2 也**不认 `WEBVIEW2_USER_DATA_FOLDER`**（仍用默认
+  `%LOCALAPPDATA%\com.workbuddy.ratelimiter\EBWebView`）。
+  → 基于 CDP 的诊断脚本（diag_config / diag_scope / verify_no_freeze）在本机
+  **已无法使用**（`Invalid URL` = 拿不到 CDP target）。
+  → 因此把关键不变量改成**源码级单测**断言，比 CDP 脚本更可靠、不依赖环境。
+- `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` 只在**新建**浏览器进程时生效；
+  若该 user-data-dir 已有存活浏览器进程，会被复用 → 参数丢失 → 端口起不来。
+- 清理 WebView2 孤儿进程时要按 `--user-data-dir` 精确匹配本应用，
+  **不要** `taskkill /IM msedgewebview2.exe`（系统组件 `MicrosoftWindows.Client.CBS`
+  的窗口进程也在用同一个镜像）。
+- Bash 工具里 heredoc 写 JSON 会被转义层吃掉反斜杠：`"C:\ADU.exe"` 落盘成
+  `"C:\ADU.exe"` → **非法 JSON 转义** → `serde_json` 解析失败 → `load()` 静默
+  回退默认值（看起来像「迁移没生效」）。写测试配置一律用 Python `json.dump`。
+
+### 15.5 验证
+- 38 → **42 单测全绿**（rl-app 7 + rl-core 22 + rl-engine 13）。
+- `check_filter.py` PASS；`verify_migration.mjs` 端到端 PASS。
+- 本机仍非管理员，**真实降速速率未实测**。
