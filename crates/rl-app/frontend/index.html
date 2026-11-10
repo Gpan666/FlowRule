@@ -39,6 +39,13 @@
   </header>
 
   <main class="workspace">
+    <!-- ── 提权提示横幅（未以管理员身份运行时显示）── -->
+    <div class="elevate-banner" id="elevateBanner" hidden>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg>
+      <div class="eb-text"><b>需要管理员权限</b><span>限速依赖 WinDivert 内核驱动，请点击右侧按钮以管理员身份重新启动本程序</span></div>
+      <button class="eb-btn" id="elevateBtn">以管理员身份运行</button>
+    </div>
+
     <!-- ── 总览 Hero ── -->
     <section class="card hero">
       <div class="hero-top">

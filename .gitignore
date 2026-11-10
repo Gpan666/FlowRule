@@ -25,3 +25,6 @@ Desktop.ini
 # ── 临时备份 ──
 *.rs.bak
 *.toml.bak
+
+# ── Release 打包产物（已上传 GitHub Release，不需进仓库）──
+liulv-*.zip

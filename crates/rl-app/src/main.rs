@@ -18,6 +18,22 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, State};
 
 mod icons;
+mod settings;
+
+/// 当前进程是否已提权（UAC 过滤令牌下返回 false，完全提权返回 true）
+#[cfg(windows)]
+fn is_elevated() -> bool {
+    #[link(name = "shell32")]
+    extern "system" {
+        fn IsUserAnAdmin() -> i32;
+    }
+    unsafe { IsUserAnAdmin() != 0 }
+}
+
+#[cfg(not(windows))]
+fn is_elevated() -> bool {
+    true
+}
 
 use rl_core::stats::{History, RateSampler, SAMPLE_INTERVAL};
 use rl_core::{
@@ -354,6 +370,7 @@ impl Inner {
         let peak = self.hist_down.max().max(self.hist_up.max());
 
         Snapshot {
+            elevated: is_elevated(),
             unit: if unit == Unit::Kb { "kb" } else { "mb" }.to_string(),
             unit_label: unit.label().to_string(),
             master: self.master,
@@ -409,10 +426,73 @@ fn parse_num(s: &str) -> f64 {
     s.trim().replace(',', ".").parse::<f64>().unwrap_or(0.0)
 }
 
+// ────────────────────────────── 设置持久化映射 ──────────────────────────────
+
+fn sel_to_str(sel: Sel) -> String {
+    match sel {
+        Sel::Profile(n) => format!("p{n}"),
+        Sel::Custom => "custom".to_string(),
+    }
+}
+
+fn str_to_sel(s: &str) -> Sel {
+    if s == "custom" {
+        Sel::Custom
+    } else if let Some(rest) = s.strip_prefix('p') {
+        Sel::Profile(rest.parse().unwrap_or(5))
+    } else {
+        Sel::Profile(5)
+    }
+}
+
+fn dir_to_saved(d: &DirState) -> settings::SavedDir {
+    settings::SavedDir { enabled: d.enabled, sel: sel_to_str(d.sel), custom: d.custom.clone() }
+}
+
+fn saved_to_dir(s: &settings::SavedDir) -> DirState {
+    DirState { enabled: s.enabled, sel: str_to_sel(&s.sel), custom: s.custom.clone() }
+}
+
+fn rule_to_saved(r: &RuleState) -> settings::SavedRule {
+    settings::SavedRule { down: dir_to_saved(&r.down), up: dir_to_saved(&r.up) }
+}
+
+fn saved_to_rule(s: &settings::SavedRule) -> RuleState {
+    RuleState { down: saved_to_dir(&s.down), up: saved_to_dir(&s.up) }
+}
+
+/// 把磁盘上的设置恢复到运行时状态（启动时使用）
+fn apply_settings(g: &mut Inner, s: &settings::Settings) {
+    g.unit = if s.unit == "mb" { Unit::Mb } else { Unit::Kb };
+    g.master = s.master;
+    g.other = saved_to_rule(&s.other);
+    g.rules = s.rules.iter().map(|(k, v)| (k.clone(), saved_to_rule(v))).collect();
+    g.selected = s.selected.clone();
+}
+
+/// 把当前运行时状态收集成可序列化结构
+fn collect_settings(g: &Inner) -> settings::Settings {
+    settings::Settings {
+        version: settings::Settings::VERSION,
+        unit: if g.unit == Unit::Mb { "mb".to_string() } else { "kb".to_string() },
+        master: g.master,
+        other: rule_to_saved(&g.other),
+        rules: g.rules.iter().map(|(k, v)| (k.clone(), rule_to_saved(v))).collect(),
+        selected: g.selected.clone(),
+    }
+}
+
+/// 任一设置变更后落盘，保证重启不丢
+fn persist(state: &State<'_, Shared>) {
+    let s = { let g = state.lock().unwrap(); collect_settings(&g) };
+    s.save();
+}
+
 // ────────────────────────────── 前端数据契约 ──────────────────────────────
 
 #[derive(Serialize)]
 struct Snapshot {
+    elevated: bool,
     unit: String,
     unit_label: String,
     master: bool,
@@ -624,48 +704,55 @@ fn get_snapshot(state: State<'_, Shared>) -> Snapshot {
 #[tauri::command]
 fn set_master(state: State<'_, Shared>, on: bool) {
     state.lock().unwrap().master = on;
+    persist(&state);
 }
 
 #[tauri::command]
 fn set_unit(state: State<'_, Shared>, unit: String) {
     let mut g = state.lock().unwrap();
     g.unit = if unit == "mb" { Unit::Mb } else { Unit::Kb };
+    persist(&state);
 }
 
 #[tauri::command]
 fn select_program(state: State<'_, Shared>, key: Option<String>) {
     state.lock().unwrap().selected = key;
+    persist(&state);
 }
 
 #[tauri::command]
 fn clear_rule(state: State<'_, Shared>, key: String) {
     state.lock().unwrap().rules.remove(&key);
+    persist(&state);
 }
 
 #[tauri::command]
 fn set_rule(state: State<'_, Shared>, edit: RuleEdit) {
-    let mut g = state.lock().unwrap();
-    let rule: &mut RuleState = match (edit.target.as_str(), edit.key.as_deref()) {
-        ("other", _) => &mut g.other,
-        ("program", Some(k)) => g.rules.entry(k.to_string()).or_insert_with(RuleState::new),
-        _ => return,
-    };
-    let ds = if edit.direction == "up" { &mut rule.up } else { &mut rule.down };
+    {
+        let mut g = state.lock().unwrap();
+        let rule: &mut RuleState = match (edit.target.as_str(), edit.key.as_deref()) {
+            ("other", _) => &mut g.other,
+            ("program", Some(k)) => g.rules.entry(k.to_string()).or_insert_with(RuleState::new),
+            _ => return,
+        };
+        let ds = if edit.direction == "up" { &mut rule.up } else { &mut rule.down };
 
-    if let Some(v) = edit.enabled {
-        ds.enabled = v;
+        if let Some(v) = edit.enabled {
+            ds.enabled = v;
+        }
+        if let Some(id) = edit.profile_id {
+            ds.sel = Sel::Profile(id);
+            ds.enabled = true; // 选挡位即视为启用该方向
+        }
+        if edit.custom == Some(true) {
+            ds.sel = Sel::Custom;
+            ds.enabled = true;
+        }
+        if let Some(v) = edit.custom_value {
+            ds.custom = v;
+        }
     }
-    if let Some(id) = edit.profile_id {
-        ds.sel = Sel::Profile(id);
-        ds.enabled = true; // 选挡位即视为启用该方向
-    }
-    if edit.custom == Some(true) {
-        ds.sel = Sel::Custom;
-        ds.enabled = true;
-    }
-    if let Some(v) = edit.custom_value {
-        ds.custom = v;
-    }
+    persist(&state);
 }
 
 #[tauri::command]
@@ -673,6 +760,24 @@ fn refresh(state: State<'_, Shared>) {
     let mut g = state.lock().unwrap();
     g.refresh_requested = true;
     g.scanning = true;
+}
+
+#[tauri::command]
+fn relaunch_admin() {
+    // 以管理员身份重新启动自身（触发 UAC），随后退出当前（未提权）实例
+    if let Ok(exe) = std::env::current_exe() {
+        let path = exe.to_string_lossy().replace('\'', "''");
+        let _ = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                &format!("Start-Process -Verb RunAs -FilePath '{path}'"),
+            ])
+            .spawn();
+    }
+    std::process::exit(0);
 }
 
 #[tauri::command]
@@ -696,7 +801,9 @@ fn win_action(app: AppHandle, action: String) {
 
 fn main() {
     let stop = Arc::new(AtomicBool::new(false));
-    let shared: Shared = Arc::new(Mutex::new(Inner::new()));
+    let mut inner = Inner::new();
+    apply_settings(&mut inner, &settings::Settings::load());
+    let shared: Shared = Arc::new(Mutex::new(inner));
 
     let backend_shared = shared.clone();
     let backend_stop = stop.clone();
@@ -713,7 +820,8 @@ fn main() {
             clear_rule,
             set_rule,
             refresh,
-            win_action
+            win_action,
+            relaunch_admin
         ])
         .build(tauri::generate_context!())
         .expect("启动 Tauri 应用失败")

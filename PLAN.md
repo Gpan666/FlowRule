@@ -192,9 +192,12 @@ loop {
 下次 refill 后再 reinject；队列满（如 256 个包 / 200ms）才真丢。平滑度显著提升。
 
 ### 4.3 权限与打包
-- `build.rs` 用 `winres`/`embed-resource` 嵌入 manifest，`requireAdministrator`。
-- 检测到非管理员时，弹窗提示并用 ShellExecute "runas" 自提权重启。
-- 发布产物：`rl-app.exe` + `WinDivert.dll` + `WinDivert64.sys` + 字体，可选 Inno Setup 打成安装包。
+- **不**嵌入 `requireAdministrator` manifest（实测会强制 UAC 弹窗、卡住非管理员账户、并让 `cargo test`
+  因 os error 740 无法运行）。改为**运行时检测 + 横幅自提权**：
+  - 后端用 `IsUserAnAdmin()` 判定，snapshot 带 `elevated` 字段下发给前端；
+  - 非管理员时前端顶部显示橙色「需要管理员权限」横幅 + 「以管理员身份运行」按钮；
+  - 点击按钮调用 `relaunch_admin` 命令，用 `powershell Start-Process -Verb RunAs` 以管理员身份重启自身后退出。
+- 发布产物：`rl-app.exe` + `WinDivert.dll` + `WinDivert64.sys` + `WebView2Loader.dll`，可选 Inno Setup 打成安装包。
 - 单文件偏好：可用自解压或把 dll/sys 释放到 `%LOCALAPPDATA%` 目录（WinDivert 支持自定义驱动路径）。
 
 ### 4.4 中文字体
@@ -393,4 +396,30 @@ release 仍是 GUI 子系统、内嵌图标，约 4.7MB。
   只显示程序名**，用 `.pname.no-icon` 的 padding 与有图标行保持文字对齐。
 - 验证：`tools/verify_ui.py` 模拟鼠标拖动标题栏得到窗口位移 `(120, 60)` → 拖拽生效；
   明暗两套截图确认列表图标与「选中程序」详情图标均正确显示、透明背景干净。
+
+### 11.6 三处功能性修复（2026-11-10 17:00 后）
+
+用户反馈三问题：**① 单位切换后重启失效；② 限速点击后没反应；③ 预设挡位也无效。**
+根因与修复：
+
+- **① 单位/规则重启失效 = 零持久化**：之前完全没有落盘逻辑，任何设置退出即丢。
+  新增 `crates/rl-app/src/settings.rs`，把 `unit / master / 其他流量 / 各程序规则 / 当前选中`
+  序列化到 exe 同目录 `config/settings.json`（便携、不写注册表）；`Inner::new()` 启动时
+  `apply_settings()` 加载，`set_master/set_unit/select_program/clear_rule/set_rule` 末尾 `persist()` 落盘。
+- **② 限速点击没反应 = 非管理员加载不了 WinDivert**：引擎逻辑本身正确（33 单测全绿、
+  Profile 0–8 映射无误），但用户当前以**非管理员**运行，无法加载内核驱动 → 点击毫无效果，
+  且之前无任何提示。改为**运行时检测 + 横幅**（见 4.3）：非管理员顶部显示橙色横幅，
+  点「以管理员身份运行」自提权重启，重启后驱动可加载、限速即时生效。
+- **③ 预设挡位无效**：同 ②，本质是驱动未加载；横幅给出解决入口后，挡位与自定义速率一并可用。
+
+> 排查中还发现一处**仅存在于开发机**的干扰：早前 manifest 测试在注册表
+> `HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers` 写入了
+> `dist\rl-app.exe = ~ RUNASADMIN`，导致即使 exe 已去掉 manifest 仍以管理员兼容层启动而
+> 报 WinError 740。已用 PowerShell 删除该属性后恢复正常。**用户机器不受影响**（该键不会随包分发）。
+
+源码改动清单（均已编译进 `dist/rl-app.exe` 17:12 版）：
+`settings.rs`（新增）、`main.rs`（持久化映射 + `is_elevated` + `relaunch_admin` 命令 +
+snapshot 增 `elevated`）、`Cargo.toml`（补 `serde_json`）、`frontend/index.html` +
+`app.js` + `styles.css`（提权横幅）。`tools/check_manifest.py` 仅作 PE manifest 校验用，不影响构建。
+
 

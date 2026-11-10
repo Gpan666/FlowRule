@@ -187,6 +187,7 @@ function render(s) {
 
   $('#statusText').textContent = s.status;
   $('#statusPill').classList.toggle('error', s.status.startsWith('引擎错误'));
+  $('#elevateBanner').hidden = s.elevated;
   const warn = $('#warningPill');
   warn.hidden = !s.warning;
   if (s.warning) warn.textContent = s.warning;
@@ -239,6 +240,7 @@ function bindEvents() {
     if (b) act('set_unit', { unit: b.dataset.unit });
   });
   $('#refreshBtn').addEventListener('click', () => act('refresh', {}));
+  $('#elevateBtn').addEventListener('click', () => call('relaunch_admin'));
   $('#clearBtn').addEventListener('click', () => {
     if (S && S.selected) act('clear_rule', { key: S.selected });
   });

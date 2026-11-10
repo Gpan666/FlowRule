@@ -2599,6 +2599,7 @@ dependencies = [
  "rl-core",
  "rl-engine-win",
  "serde",
+ "serde_json",
  "sysinfo",
  "tauri",
  "tauri-build",
