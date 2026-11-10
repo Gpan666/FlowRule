@@ -2,6 +2,8 @@
  *  UI 上 status-pill 有 ellipsis 截断，用户截图看不到错误码，这里直接从 snapshot 拿全文。
  */
 import { spawn } from 'node:child_process';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -43,7 +45,8 @@ function evaluate(ws, expression, timeoutMs = 12000) {
 
 const child = spawn(join(DIST, 'rl-app.exe'), [], {
   cwd: DIST, stdio: 'ignore',
-  env: { ...process.env, WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${PORT}` },
+  env: { ...process.env, WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${PORT}`,
+    WEBVIEW2_USER_DATA_FOLDER: mkdtempSync(join(tmpdir(), 'rl-cdp-')) },
 });
 let ws;
 try {

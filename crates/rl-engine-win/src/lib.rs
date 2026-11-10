@@ -32,8 +32,12 @@ use rl_core::{ByteCounter, Direction, Engine, LimitConfig, TokenBucket};
 
 /// WinDivert 文档定义的最大包长 = 40 + 0xFFFF
 const WINDIVERT_MTU_MAX: usize = 40 + 0xFFFF;
-/// recv 队列超时（毫秒）。设短一点，保证 poll 能及时返回去响应新配置
-const QUEUE_TIME_MS: u64 = 4;
+/// 包在驱动队列里被自动丢弃前的**最短**等待时间（毫秒）。
+/// 注意它不是 recv 超时：设得太小（原来 4ms）会让高带宽下的包在用户态来不及
+/// 处理时就被驱动丢弃，实测速率被额外压低、且抖动明显。
+/// 取 20ms：两个句柄各一次空读最多约 40ms，配置响应仍足够快，
+/// 同时给高带宽流量更充裕的排队窗口。
+const QUEUE_TIME_MS: u64 = 20;
 /// WINDIVERT_LAYER_NETWORK
 const LAYER_NETWORK: u32 = 0;
 /// WINDIVERT_PARAM_QUEUE_TIME
@@ -332,6 +336,8 @@ pub struct EngineDiag {
     pub udp_entries: usize,
     /// 当前 PID→程序 映射条目数
     pub pid_rules: usize,
+    /// 当前每个生效令牌桶的速率（人类可读），用于确认「到底限的是多少」
+    pub bucket_desc: String,
 }
 
 pub struct WinDivertEngine {
@@ -409,6 +415,22 @@ impl WinDivertEngine {
         d.pid_rules = self.pid_key.len();
         d.tcp_entries = self.proc_map.tcp_len();
         d.udp_entries = self.proc_map.udp_len();
+        let mut parts: Vec<String> = self
+            .buckets
+            .iter()
+            .map(|((k, dir), b)| {
+                let name = if k == OTHER {
+                    "其他流量".to_string()
+                } else {
+                    // 程序 key 是完整路径，只显示文件名
+                    let s = k.replace('\\', "/");
+                    s.rsplit('/').next().unwrap_or(k).to_string()
+                };
+                format!("{} {} = {}", name, dir.label(), rl_core::format_bps(b.rate()))
+            })
+            .collect();
+        parts.sort();
+        d.bucket_desc = parts.join(" · ");
         d
     }
 

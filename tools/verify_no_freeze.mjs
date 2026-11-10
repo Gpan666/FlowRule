@@ -10,6 +10,8 @@
  * 用法：node tools/verify_no_freeze.mjs
  */
 import { spawn } from 'node:child_process';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -75,7 +77,8 @@ async function main() {
   const child = spawn(EXE, [], {
     cwd: DIST,
     stdio: 'ignore',
-    env: { ...process.env, WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${PORT}` },
+    env: { ...process.env, WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${PORT}`,
+    WEBVIEW2_USER_DATA_FOLDER: mkdtempSync(join(tmpdir(), 'rl-cdp-')) },
   });
 
   let ws;

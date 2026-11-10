@@ -672,9 +672,10 @@ fn backend(shared: Shared, stop: Arc<AtomicBool>) {
                     // 失败也要刷新诊断（否则诊断恒为 0，会误导排查）
                     let d = engine.diag();
                     g.engine_diag = format!(
-                        "句柄 {}/2 · 桶 {} · 收包 {} · 命中限速 {} · 丢弃 {} · 程序识别 {} · 连接表 TCP {}/UDP {}",
+                        "句柄 {}/2 · 桶 {} · 收包 {} · 命中限速 {} · 丢弃 {} · 程序识别 {} · 连接表 TCP {}/UDP {}\n生效桶：{}",
                         d.handles, d.buckets, d.packets, d.limited, d.dropped,
-                        d.program_hits, d.tcp_entries, d.udp_entries
+                        d.program_hits, d.tcp_entries, d.udp_entries,
+                        if d.bucket_desc.is_empty() { "无" } else { &d.bucket_desc }
                     );
                     last_diag_at = Instant::now();
                     // 失败后不要高频重试打开驱动句柄
@@ -741,13 +742,16 @@ fn backend(shared: Shared, stop: Arc<AtomicBool>) {
         if w != last_warning || now.duration_since(last_diag_at) >= Duration::from_millis(500) {
             let d = engine.diag();
             let diag_text = format!(
-                "句柄 {}/2 · 桶 {} · 收包 {} · 命中限速 {} · 丢弃 {} · 程序识别 {} · 连接表 TCP {}/UDP {}",
+                "句柄 {}/2 · 桶 {} · 收包 {} · 命中限速 {} · 丢弃 {} · 程序识别 {} · 连接表 TCP {}/UDP {}\n生效桶：{}",
                 d.handles, d.buckets, d.packets, d.limited, d.dropped,
-                d.program_hits, d.tcp_entries, d.udp_entries
+                d.program_hits, d.tcp_entries, d.udp_entries,
+                if d.bucket_desc.is_empty() { "无" } else { &d.bucket_desc }
             );
             // 开了总开关却没有任何桶 = 根本没接管流量，明确提示，避免「点了没效果」
+            // （注意：v2 起「其他流量」默认不限速，所以只点总开关本身不会产生任何桶，
+            //  必须选程序或主动设「其他流量」才会接管，这是预期行为，不是 bug）
             let hint = if d.handles == 0 && d.buckets == 0 {
-                Some("未接管流量：请选择挡位或开启一个方向的限速开关".to_string())
+                Some("未接管流量：请选择程序设置限速，或在「其他流量」中开启限速".to_string())
             } else {
                 None
             };
@@ -795,17 +799,6 @@ fn set_master(state: State<'_, Shared>, on: bool) {
     let s = {
         let Some(mut g) = lock_mutex(&state) else { return };
         g.master = on;
-        if on {
-            // 「开启总开关」却一条生效规则都没有 → LimitConfig 全 0，引擎不会打开任何
-            // 句柄，用户会看到「开关亮了但完全没限速」。默认挡位在界面上高亮、
-            // 但 DirState.enabled 初始为 false，正是这个陷阱的来源。
-            // 此时自动启用「其他流量」下行的当前选中挡位，让开启立即有可见效果。
-            let any = g.other.down.enabled || g.other.up.enabled
-                || g.rules.values().any(|r| r.down.enabled || r.up.enabled);
-            if !any {
-                g.other.down.enabled = true;
-            }
-        }
         collect_settings(&g)
     };
     s.save();
@@ -845,35 +838,39 @@ fn clear_rule(state: State<'_, Shared>, key: String) {
 fn set_rule(state: State<'_, Shared>, edit: RuleEdit) {
     let s = {
         let Some(mut g) = lock_mutex(&state) else { return };
-        let rule: &mut RuleState = match (edit.target.as_str(), edit.key.as_deref()) {
-            ("other", _) => &mut g.other,
-            ("program", Some(k)) => g.rules.entry(k.to_string()).or_insert_with(RuleState::new),
-            _ => return,
-        };
-        let ds = if edit.direction == "up" { &mut rule.up } else { &mut rule.down };
-
-        if let Some(v) = edit.enabled {
-            ds.enabled = v;
-        }
-        if let Some(id) = edit.profile_id {
-            ds.sel = Sel::Profile(id);
-            ds.enabled = true; // 选挡位即视为启用该方向
-        }
-        if edit.custom == Some(true) {
-            ds.sel = Sel::Custom;
-            ds.enabled = true;
-        }
-        if let Some(ref v) = edit.custom_value {
-            ds.custom = v.clone();
-        }
-        // 用户主动设挡位/开关/自定义速率，意图就是「开始限速」。
-        // 若总开关还关着，current_config() 会返回 unlimited()、引擎根本不打开句柄，
-        // 表现为「点了挡位高亮了却完全没效果」。这里自动开启总开关，
-        // 用户仍可随时手动关掉总开关来全局暂停。
         let activating = edit.enabled == Some(true)
             || edit.profile_id.is_some()
             || edit.custom == Some(true)
             || edit.custom_value.is_some();
+
+        {
+            let rule: &mut RuleState = match (edit.target.as_str(), edit.key.as_deref()) {
+                ("other", _) => &mut g.other,
+                ("program", Some(k)) => g.rules.entry(k.to_string()).or_insert_with(RuleState::new),
+                _ => return,
+            };
+            let ds = if edit.direction == "up" { &mut rule.up } else { &mut rule.down };
+
+            if let Some(v) = edit.enabled {
+                ds.enabled = v;
+            }
+            if let Some(id) = edit.profile_id {
+                ds.sel = Sel::Profile(id);
+                ds.enabled = true; // 选挡位即视为启用该方向
+            }
+            if edit.custom == Some(true) {
+                ds.sel = Sel::Custom;
+                ds.enabled = true;
+            }
+            if let Some(ref v) = edit.custom_value {
+                ds.custom = v.clone();
+            }
+        } // 释放 g 的可变借用
+
+        // 用户主动设挡位/开关/自定义速率，意图就是「开始限速」。
+        // 若总开关还关着，current_config() 会返回 unlimited()、引擎根本不打开句柄，
+        // 表现为「点了挡位高亮了却完全没效果」。这里自动开启总开关，
+        // 用户仍可随时手动关掉总开关来全局暂停。
         if activating {
             g.master = true;
         }

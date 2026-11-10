@@ -31,12 +31,24 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub const VERSION: u32 = 1;
+    pub const VERSION: u32 = 3;
 
     pub fn load() -> Self {
         if let Some(path) = settings_path() {
             if let Ok(text) = std::fs::read_to_string(&path) {
-                if let Ok(s) = serde_json::from_str::<Settings>(&text) {
+                if let Ok(mut s) = serde_json::from_str::<Settings>(&text) {
+                    // v1/v2 里「其他流量」频繁被系统自动塞入限速（点总开关、无任何程序规则时
+                    // 自动套 1 MB/s 默认挡位），表现就是「整台电脑被限」——正是用户报告的 bug。
+                    // 升级时：只要「其他流量」被启用但却没有任何程序规则，就视为遗留自动默认，
+                    // 一律清除（v3 起「其他流量」默认不限速）。若用户确实单独设置过某程序，
+                    // 则原样保留其配置。用户若本就想限「其他流量」，重新点一下即可（2 秒）。
+                    if s.version < Self::VERSION {
+                        if (s.other.down.enabled || s.other.up.enabled) && s.rules.is_empty() {
+                            s.other = SavedRule::default();
+                        }
+                        s.version = Self::VERSION;
+                        return s;
+                    }
                     if s.version == Self::VERSION {
                         return s;
                     }
