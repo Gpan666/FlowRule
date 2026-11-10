@@ -1,0 +1,6 @@
+Windows 单程序网络限速工具（Rust + Tauri + WinDivert）。
+
+- 限速只作用于目标程序，不再整机被限
+- 自定义速率（如 20MB）真实按 20MB/s 生效
+- 引擎改用 WinDivertRecvEx 重叠 I/O + 合法 QUEUE_TIME(100ms)
+- 支持 IPv6 / QUIC 流量归属（IPv6 TCP 因 Windows API 限制暂归其他流量）

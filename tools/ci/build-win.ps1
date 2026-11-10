@@ -1,4 +1,4 @@
-# 在 CNB 自托管 Windows 构建节点上编译流律（liulv-ratelimiter）
+﻿# 在 CNB 自托管 Windows 构建节点上编译流律（liulv-ratelimiter）
 #
 # 前置条件（一次性，在接入的 Windows 机器上准备）：
 #   1. Rust 工具链（stable-x86_64-pc-windows-msvc）；若未安装，本脚本会自动用 rustup 安装。
@@ -18,6 +18,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+# 编码：本文件以 UTF-8 with BOM 保存，Windows PowerShell 5.1 才能正确识别中文；
+# 再把控制台输出也切到 UTF-8，避免日志里的中文在控制台变成问号。
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    $OutputEncoding = [System.Text.Encoding]::UTF8
+} catch { }
 
 $workspace = (Resolve-Path $env:CNB_BUILD_WORKSPACE).Path
 Set-Location $workspace
@@ -111,16 +118,29 @@ try {
 }
 
 # ---------------------------------------------------------------- 2. 收集运行时文件
-$outFull = Join-Path $workspace $OutDir
-New-Item -ItemType Directory -Force -Path $outFull | Out-Null
-Copy-Item -LiteralPath $exe -Destination (Join-Path $outFull 'rl-app.exe') -Force
+# 在 %TEMP% 下的独立暂存目录组装，避免工作区里的 dist\rl-app.exe 正被运行中的
+# 程序占用（Copy-Item 会因文件锁直接失败），也避免污染仓库工作区。
+$stage = Join-Path $env:TEMP 'liulv-stage'
+if (Test-Path $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
+New-Item -ItemType Directory -Force -Path $stage | Out-Null
+Copy-Item -LiteralPath $exe -Destination (Join-Path $stage 'rl-app.exe') -Force
 
 foreach ($f in @('WinDivert.dll', 'WinDivert64.sys', 'WebView2Loader.dll')) {
     $src = Join-Path $asciiSrc ("assets\" + $f)
     if (-not (Test-Path $src)) { throw "缺少运行时文件：$src" }
-    Copy-Item -LiteralPath $src -Destination (Join-Path $outFull $f) -Force
+    Copy-Item -LiteralPath $src -Destination (Join-Path $stage $f) -Force
 }
-Write-Step "运行时文件已收集到 $outFull"
+Write-Step "运行时文件已收集到 $stage"
+
+# 同时把产物放一份到工作区 dist/ 供人工取用；文件可能被占用，放不下不致命。
+$outFull = Join-Path $workspace $OutDir
+New-Item -ItemType Directory -Force -Path $outFull | Out-Null
+try {
+    Copy-Item -Path (Join-Path $stage '*') -Destination $outFull -Force -ErrorAction Stop
+    Write-Step "产物已复制到 $outFull"
+} catch {
+    Write-Step "工作区 dist/ 被占用，跳过复制（不影响打包与上传）：$($_.Exception.Message)"
+}
 
 # ---------------------------------------------------------------- 3. 打包 zip
 $ver = (Select-String -Path (Join-Path $asciiSrc 'Cargo.toml') -Pattern '^version\s*=\s*"([^"]+)"' |
@@ -128,15 +148,22 @@ $ver = (Select-String -Path (Join-Path $asciiSrc 'Cargo.toml') -Pattern '^versio
 $zipName = "liulv-v$ver-win-x64.zip"
 $zipPath = Join-Path $workspace $zipName
 if (Test-Path $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
-Compress-Archive -Path (Join-Path $outFull '*') -DestinationPath $zipPath -Force
+Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zipPath -Force
 Write-Step ("已打包：$zipName（" + (Get-Item $zipPath).Length + " 字节）")
 
 # 供后续 stage 使用的元数据
-Set-Content -LiteralPath (Join-Path $outFull 'artifact.json') -Encoding UTF8 -Value (@{
+# 用 UTF-8 无 BOM 写盘：后续 upload-artifact.ps1 按 UTF-8 显式读取，
+# 避免 Windows PowerShell 5.1 的 Set-Content -Encoding UTF8 写入 BOM 后解析 JSON 出错。
+$meta = @{
     name    = $zipName
     path    = $zipPath
     size    = (Get-Item $zipPath).Length
     version = $ver
-} | ConvertTo-Json)
+} | ConvertTo-Json
+[System.IO.File]::WriteAllText(
+    (Join-Path $workspace 'dist\artifact.json'),
+    $meta,
+    (New-Object System.Text.UTF8Encoding($false))
+)
 
 Write-Step "构建完成：$zipName"

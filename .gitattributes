@@ -1,0 +1,12 @@
+# ── 编码敏感文件：禁止任何换行/编码转换，保证检出后字节完全一致 ──────────
+#
+# *.ps1 必须以 UTF-8 **with BOM** 保存。Windows PowerShell 5.1（CNB 自托管
+# Windows runner 的默认 shell）只靠 BOM 判定 .ps1 编码：无 BOM 时按系统 ANSI
+# （中文系统 = GBK）解析，中文全部乱码，甚至因非法字节直接语法报错。
+#
+# 这里用 -text 让 git 把这些文件当二进制处理：入库什么字节，检出就是什么字节，
+# BOM 与 CRLF 都不会被 core.autocrlf / working-tree-encoding 改写。
+# 注意：core.autocrlf=true 时 .ps1 会以 CRLF 落盘，这是 Windows 上期望的。
+
+*.ps1 -text
+*.txt -text

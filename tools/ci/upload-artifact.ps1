@@ -1,4 +1,4 @@
-# 把构建好的 zip 上传到 CNB：
+﻿# 把构建好的 zip 上传到 CNB：
 #   -Mode commit  → 作为本次提交的「附件」（commit assets），在提交页/仓库页可下载
 #   -Mode release → 创建（或复用）对应 Tag 的 Release，并把 zip 作为 Release 附件
 #
@@ -13,10 +13,24 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+# 编码：本文件以 UTF-8 with BOM 保存，Windows PowerShell 5.1 才能正确识别中文；
+# 再把控制台输出也切到 UTF-8，避免日志里的中文在控制台变成问号。
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    $OutputEncoding = [System.Text.Encoding]::UTF8
+} catch { }
+
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 Set-Location $root
 
-$meta = Get-Content -LiteralPath (Join-Path $root 'dist\artifact.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+# 显式按 UTF-8 无 BOM 读元数据（不依赖脚本自身编码，也不受 BOM 干扰）
+$metaPath = Join-Path $root 'dist\artifact.json'
+$metaJson = [System.IO.File]::ReadAllText($metaPath, (New-Object System.Text.UTF8Encoding($false)))
+$meta = $metaJson | ConvertFrom-Json
+
+# Release 正文：独立 UTF-8 无 BOM 文本文件，显式按 UTF-8 读取
+$bodyPath = Join-Path $root 'tools\ci\release-body.txt'
+$releaseBody = [System.IO.File]::ReadAllText($bodyPath, (New-Object System.Text.UTF8Encoding($false)))
 $file = $meta.path
 if (-not (Test-Path -LiteralPath $file)) { throw "产物不存在：$file" }
 $size = (Get-Item -LiteralPath $file).Length
@@ -100,7 +114,9 @@ switch ($Mode) {
                 tag_name         = $tag
                 name             = $tag
                 target_commitish = $env:CNB_COMMIT
-                body             = "Windows 单程序网络限速工具（Rust + Tauri + WinDivert）。`n`n- 限速只作用于目标程序，不再整机被限`n- 自定义速率（如 20MB）真实按 20MB/s 生效`n- 引擎改用 WinDivertRecvEx 重叠 I/O + 合法 QUEUE_TIME(100ms)`n- 支持 IPv6 / QUIC 流量归属"
+                # Release 正文放在独立 UTF-8 文本文件里，避免中文经过
+                # .ps1 源码 → PowerShell 解析 → JSON 序列化这条链路时被转码破坏。
+                body             = $releaseBody
                 draft            = $false
                 prerelease       = $false
             }
