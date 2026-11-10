@@ -35,18 +35,20 @@
                    │ Tauri invoke    │ Tauri events
 ┌──────────────────┴─────────────────▼──────────────┐
 │  rl-app（Rust 后端）                                │
-│  共享状态 Arc<Mutex> · 单后台线程 · Tauri 命令        │
+│  共享状态 Arc<Mutex>（带超时加锁）· 单后台线程       │
+│  配置落盘 config/settings.json                     │
 └─────────┬──────────────────────────┬───────────────┘
           │                          │
 ┌─────────▼──────────┐   ┌───────────▼──────────────┐
 │  rl-core            │   │  rl-engine-win            │
-│  令牌桶 · 单位换算   │   │  WinDivert 驱动 (MIT)      │
-│  挡位 · 统计采样     │   │  按进程 filter 句柄        │
+│  令牌桶 · 单位换算   │   │  WinDivert 2.2 全局句柄×2 │
+│  挡位 · 统计采样     │   │  五元组→PID→令牌桶分派     │
 └────────────────────┘   └───────────────────────────┘
 ```
 
 - **rl-core**：纯逻辑，无平台依赖，可单元测试（单位换算、令牌桶、预设挡位、速率统计）
-- **rl-engine-win**：基于 WinDivert 的限速引擎，用户态截包 → 令牌桶判定 → 重注入 / 丢弃
+- **rl-engine-win**：WinDivert 2.2 限速引擎 + `GetExtendedTcpTable/UdpTable` 进程归属映射，
+  用户态截包 → 五元组识别进程 → 分派令牌桶 → 重注入 / 丢弃
 - **rl-app**：Tauri 2 后端（共享状态 + 单后台线程负责引擎 poll / 进程扫描 / 采样）与 Miuix 前端
 
 ## 📁 目录结构
@@ -56,14 +58,16 @@ liulv-ratelimiter/
 ├─ Cargo.toml                 # workspace
 ├─ crates/
 │  ├─ rl-core/                # 纯逻辑：单位 / 令牌桶 / 挡位 / 统计
-│  ├─ rl-engine-win/          # WinDivert 引擎实现
+│  ├─ rl-engine-win/src/
+│  │  ├─ lib.rs               # 全局句柄 + 五元组分派 + 令牌桶
+│  │  └─ proc_map.rs          # 连接表→PID 映射（iphlpapi.dll）
 │  └─ rl-app/                 # Tauri 2 后端 + Miuix 前端
 │     ├─ frontend/            # index.html / styles.css / app.js（零 npm 依赖）
 │     ├─ icons/               # 应用图标
 │     ├─ capabilities/        # Tauri 权限
-│     └─ src/                 # main.rs + icons.rs
+│     └─ src/                 # main.rs + icons.rs + settings.rs
 ├─ assets/                    # WinDivert.dll / WinDivert64.sys / WebView2Loader.dll
-├─ tools/                     # 验证 / 截图脚本
+├─ tools/                     # check_filter.py / verify_no_freeze.mjs / verify_ui.py 等
 ├─ docs/screenshots/          # README 用截图
 ├─ PLAN.md                    # 开发规划与决策记录
 └─ README.md
@@ -108,20 +112,29 @@ cargo build --release --workspace
 
 ## ⚙️ 限速原理
 
-WinDivert 在网络栈中拦截 IP 包，引擎用令牌桶判定每个包是否放行：
+WinDivert 在网络栈拦截 IP 包，引擎在**用户态**识别包属于哪个程序并分派令牌桶：
 
 ```
-网卡 → WinDivert 拦截 → 令牌桶判定 → 放行(reinject) / 丢弃
+网卡 → WinDivert 全局句柄(上/下行各 1 个)
+     → 解析 IPv4+TCP/UDP 五元组
+     → GetExtendedTcpTable/UdpTable 查 owning PID
+     → PID→程序规则→令牌桶 → 放行(reinject) / 丢弃
 ```
 
+- **为什么不用 `processId` 过滤**：WinDivert 2.2 的 `WINDIVERT_LAYER_NETWORK` 明确不支持
+  `processId` 字段（`processId` 仅在 FLOW / SOCKET / REFLECT 层可用），带它的表达式会
+  让 `WinDivertOpen` 返回错误 87。因此改用连接表在用户态做归属判定。
+  `tools/check_filter.py` 会用真实 DLL 离线编译校验所有 filter，防止回归。
+- 上 / 下行各一个全局句柄，filter 天然互斥，不存在「多句柄重叠重复注入」问题
 - 超过速率的包被丢弃，TCP 拥塞控制会自动降速（下行限速的「正常机制」）
-- 上行 / 下行各开一个句柄、两个令牌桶，可独立限速
-- 多句柄 filter 不重叠（已限速进程被「其他流量」句柄显式排除），避免重复注入
-- 限速对象为「进程」，通过 `processId` 过滤，跨 Windows 10 / 11 通用
+- `not impostor` 排除重注入的包，避免自捕获死循环；连接表每 700ms 刷新一次
+- 限速对象为「程序」（同一 exe 的多进程共用一个带宽预算），跨 Windows 10 / 11 通用
 
 ## 📌 已知限制
 
-- 仅支持 Windows（依赖 WinDivert）
+- 仅支持 Windows（依赖 WinDivert），且需管理员权限加载驱动
+- 只对 **IPv4 + TCP/UDP** 生效；IPv6、ICMP 及非首片 IP 分片不走程序归属判定（归入「其他流量」）
+- 进程归属依赖系统连接表，连接刚建立 / 已关闭的短暂窗口内可能归入「其他流量」
 - 未做系统托盘、开机自启、安装包（见 `PLAN.md` 里程碑）
 - 高带宽（千兆）下用户态逐包处理 CPU 占用会上升
 

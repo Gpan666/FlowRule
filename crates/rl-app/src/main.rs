@@ -610,6 +610,7 @@ fn backend(shared: Shared, stop: Arc<AtomicBool>) {
     let mut last_scan = Instant::now().checked_sub(SCAN_INTERVAL).unwrap_or_else(Instant::now);
     let mut last_attempted: Option<LimitConfig> = None;
     let mut last_error: Option<String> = None;
+    let mut last_warning: Option<String> = None;
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -642,15 +643,28 @@ fn backend(shared: Shared, stop: Arc<AtomicBool>) {
                             "限速中 · 其他流量".to_string()
                         }
                     };
-                    g.warning = engine.warning().map(|s| s.to_string());
+                    // warning 交给循环末尾统一同步（poll 里也可能产生新警告）
                 }
                 Err(e) => {
                     last_error = Some(e.clone());
+                    // 失败要允许重试：否则 last_attempted 一直等于 cfg，用户修好环境后
+                    // 不重启程序就永远无法恢复（比如刚点完提权、或刚放行安全软件）。
+                    last_attempted = None;
                     let Some(mut g) = lock_mutex(&shared) else { continue };
                     g.status = format!("引擎错误：{e}");
-                    if e.contains("权限") || e.contains("管理员") || e.contains("驱动") {
-                        g.warning = Some("请以管理员身份运行本程序".to_string());
-                    }
+                    // 只在错误明确来自「权限不足」时才提示提权。
+                    // 旧判断用 e.contains("管理员")，而错误文案里硬编码了这几个字，
+                    // 导致打开句柄的任何失败（filter 非法、驱动被拦截…）都误报成权限问题。
+                    g.warning = if e.contains("权限不足") || e.contains("Win32 错误 5") {
+                        Some("请以管理员身份运行本程序".to_string())
+                    } else {
+                        Some(e.clone())
+                    };
+                    last_warning = g.warning.clone();
+                    // 失败后不要高频重试打开驱动句柄
+                    drop(g);
+                    thread::sleep(Duration::from_millis(500));
+                    continue;
                 }
             }
         }
@@ -702,6 +716,15 @@ fn backend(shared: Shared, stop: Arc<AtomicBool>) {
                 }
                 thread::sleep(Duration::from_millis(250));
             }
+        }
+
+        // 5) 同步引擎的非致命警告（进程识别失败等），仅在变化时写共享状态
+        let w = engine.warning().map(|s| s.to_string());
+        if w != last_warning {
+            if let Some(mut g) = lock_mutex(&shared) {
+                g.warning = w.clone();
+            }
+            last_warning = w;
         }
     }
 }

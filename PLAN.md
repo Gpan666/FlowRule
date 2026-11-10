@@ -468,3 +468,96 @@ Rust 签名是单个 `edit: RuleEdit`，前端却一直传平铺参数，`call()
 
 
 
+## 12. 架构级纠错（2026-11-10 19:20）：WinDivert 2.2 NETWORK 层不支持 processId
+
+用户反馈「以管理员运行后，启用限速就报错」：
+`引擎错误：打开 下行（c:\program files\google\chrome...）句柄失败` + 误报「请以管理员身份运行本程序」。
+
+### 12.1 根因：整个按进程限速的 filter 方案从第一天起就是错的
+
+WinDivert 2.2 官方文档（filter language 章节）明确写：
+
+> The `processId` field ... **is not supported by the `WINDIVERT_LAYER_NETWORK*` layers**.
+> Due to technical limitations, process ID information is not available at these layers.
+
+`processId` 只在 **FLOW(2) / SOCKET(3) / REFLECT(4)** 层可用。而项目所有句柄都开在
+`WINDIVERT_LAYER_NETWORK = 0`，却拼了 `processId == N`。用 dist 里真实 DLL 的
+`WinDivertHelperCompileFilter` 离线编译（纯用户态，无需驱动/管理员）实测：
+
+```
+OK   base down/up                     (不含 processId)
+FAIL ... (processId == 4242)          "Filter expression contains a bad token for layer" pos=54
+FAIL ... processId != 100 ...         同上 pos=53
+OK   processId == 4242                layer=2 (FLOW) 才通过
+```
+
+直接调 `WinDivertOpen` 对照（非管理员）：
+
+| filter | GetLastError | 含义 |
+|---|---|---|
+| 新 base_filter（上/下行） | **5** | filter 合法，只是权限不足 ✔ |
+| 旧 `processId == N` | **87** | filter 非法，**管理员也必然失败** ✘ |
+
+所以之前非管理员时是「驱动加载失败」掩盖了 filter 错误；一提权就暴露。
+33 个单测只校验了 filter **字符串怎么拼**，从没拿真实 DLL 编译过，因此一直没发现。
+
+### 12.2 误报的来历
+后端判断 `if e.contains("管理员")` 来决定要不要显示「请以管理员身份运行本程序」，
+而 `Limiter::open` 的错误文案里硬编码了「请以管理员身份运行，并确认 WinDivert64.sys…」，
+导致**任何**打开句柄失败都被归因为权限问题。已改为按真实 Win32 错误码分类
+（2/5/87/577/654/1060/1275/1753 各给可操作建议），状态条也改为长错误换行完整显示。
+
+### 12.3 另一处隐藏的致命 bug：WINDIVERT_ADDRESS 少 16 字节
+`windivert.h` 里 `sizeof(WINDIVERT_ADDRESS) == 80`
+（`INT64 Timestamp` 8 + `UINT32 位域块` 4 + `UINT32 Reserved2` 4 + 匿名 union 64），
+项目一直写成 `Address([u8; 64])`。`WinDivertRecv` 写 80 字节 → 缓冲区溢出。
+因为句柄从未打开成功、recv 从没被调用，这个 bug 被掩盖至今。已改为 80 字节，
+并把大小写进 `tools/check_filter.py` 的静态断言。
+
+### 12.4 新架构（用户选择「完整重构，保留按程序限速」）
+
+```
+每方向只开 1 个全局句柄（base_filter，不含 processId）
+  → 解析 IPv4+TCP/UDP 五元组
+  → GetExtendedTcpTable(TCP_TABLE_OWNER_PID_ALL) / GetExtendedUdpTable(UDP_TABLE_OWNER_PID)
+    建立「规范化五元组 → owning PID」映射（每 700ms 刷新，不需要管理员）
+  → PID → 程序 key（LimitConfig 的规则）→ 该程序/方向的令牌桶
+  → 令牌足够则 WinDivertSend 重注入，不足则丢弃
+```
+
+- `crates/rl-engine-win/src/proc_map.rs`（新增）：`libloading` 动态加载 iphlpapi.dll，
+  避开 GNU 工具链链接系统 .lib 的问题；TCP 表双向插入（正/反五元组都映射到同一 PID），
+  UDP 表按 local endpoint 映射。注意 MIB 端口是网络序放 DWORD 低 16 位，需 `swap_bytes`。
+- `crates/rl-engine-win/src/lib.rs` 重写：删掉 `wanted()/add_other()/MAX_EXCLUDES` 整套
+  「多句柄 filter 不能重叠」逻辑（两个全局句柄 inbound/outbound 天然互斥，问题消失）。
+  新增 `parse_tuple`（IPv4/TCP/UDP 头解析、非首片分片兜底）、`classify`、`pick_bucket`、
+  `DirHandle`（每方向一个），以及打开句柄前的 `validate_filter`（用 DLL 离线编译校验）。
+- `base_filter` 增加 `and not impostor`，避免重注入的包被自己再次捕获形成死循环。
+- **限速稳定性**：`rate_signature` 故意不含 pids。进程扫描每 3 秒刷新 pids 会改变
+  `LimitConfig`，若每次都重建桶就会把令牌重置为满、曲线清零；现在只在速率真变化时
+  复用旧桶并 `set_rate`，pids 变化只更新 PID→key 映射。
+- `rl-core` 里 `build_filter` / `build_program_filter` 及 `FILTER_MAX_LEN` / `MAX_EXCLUDES`
+  全部删除（会生成非法 filter，留着是隐患），`Direction::filter()` 别名一并删除。
+
+### 12.5 验证
+
+- `cargo test --workspace`：**35 个单测全绿**（rl-core 22 + engine 13），
+  含 `real_connection_tables_load` 真实 FFI 冒烟（GetExtendedTcpTable 不需要管理员）。
+  测试总数下降是因为删掉了 7 个「校验非法 filter 字符串怎么拼」的旧测试，
+  换成 `parse_tuple` / `classify` / `pick_bucket` / 连接表解析等新架构测试。
+- `python tools/check_filter.py`：用真实 DLL 离线编译 rl-core 源码里抽出的两个
+  `base_filter`，静态断言引擎代码无 `processId ==/!=`、`WINDIVERT_ADDRESS == 80`，
+  并用反例确认 DLL 确实会拒绝 processId（保证校验有判别力）。全部 PASS。
+- `node tools/verify_no_freeze.mjs`：9 个命令全 PASS（2–73ms）、持久化落盘正确。
+- `node tools/diag_engine.mjs`（非管理员）：错误精确为
+  `打开下行全局句柄失败（Win32 错误 5）：权限不足…`，提示「请以管理员身份运行本程序」——
+  证明新 filter 已通过编译阶段、只被权限拦住，且文案不再误报。
+- `python tools/verify_ui.py`：明暗主题、拖拽 `(120,60)`、截图正常，无残留进程。
+
+> 开发机当前会话非管理员（`IsInRole(Administrator) = False`），**驱动加载后的真实限速
+> 速率无法在本机实测**；已验证到「filter 合法 + 只差权限」这一层。用户提权后即可生效。
+
+### 12.6 仍需在真机确认
+- 提权后下行/上行速率是否稳定在设定值 ±10%（计划用下载大文件 / iperf3 观察曲线）
+- 进程归属映射对短连接、UDP、TIME_WAIT 的覆盖准确度
+- 安全软件是否会拦截 WinDivert64.sys（错误 1275 已给出白名单提示）

@@ -7,10 +7,7 @@ pub mod stats;
 pub mod unit;
 
 pub use bucket::TokenBucket;
-pub use process::{
-    build_filter, build_program_filter, program_key, LimitConfig, ProcessInfo, ProgramInfo,
-    ProgramRule,
-};
+pub use process::{program_key, LimitConfig, ProcessInfo, ProgramInfo, ProgramRule};
 pub use stats::{ByteCounter, History, RateSampler, HISTORY_POINTS, SAMPLE_INTERVAL};
 pub use unit::{format_bps, Rate, Unit};
 
@@ -35,17 +32,17 @@ impl Direction {
         }
     }
 
-    /// 不带进程条件的基础表达式，供 build_filter 继续拼
+    /// 全局句柄使用的过滤表达式（NETWORK 层，WinDivert 2.2 已离线编译校验通过）。
+    ///
+    /// ⚠️ NETWORK 层**不支持 `processId` 字段**，绝不能在这里拼进程条件；
+    /// 进程归属改由引擎在用户态用五元组 + 系统连接表判定（见 rl-engine-win::proc_map）。
+    ///
+    /// `not impostor` 用于排除 WinDivertSend 重注入的包，避免自己捕获自己形成死循环。
     pub fn base_filter(self) -> &'static str {
         match self {
-            Direction::Down => "inbound and ip and (tcp or udp) and not loopback",
-            Direction::Up => "outbound and ip and (tcp or udp) and not loopback",
+            Direction::Down => "inbound and ip and (tcp or udp) and not loopback and not impostor",
+            Direction::Up => "outbound and ip and (tcp or udp) and not loopback and not impostor",
         }
-    }
-
-    /// 全局（不限进程）的过滤表达式
-    pub fn filter(self) -> &'static str {
-        self.base_filter()
     }
 }
 

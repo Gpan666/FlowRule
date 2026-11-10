@@ -208,11 +208,17 @@ function render(s) {
   $$('.seg-item').forEach((b) => b.classList.toggle('active', b.dataset.unit === s.unit));
 
   $('#statusText').textContent = s.status;
+  $('#statusText').title = s.status;
   $('#statusPill').classList.toggle('error', s.status.startsWith('引擎错误'));
   $('#elevateBanner').hidden = s.elevated;
   const warn = $('#warningPill');
   warn.hidden = !s.warning;
-  if (s.warning) warn.textContent = s.warning;
+  if (s.warning) {
+    warn.textContent = s.warning;
+    warn.title = s.warning;
+    // 长诊断（含 Win32 错误码）换行完整显示，短提示保持胶囊单行
+    warn.classList.toggle('long', s.warning.length > 18);
+  }
 
   $$('[data-role="profileChip"]').forEach((b, i) => {
     const p = s.profiles[i % s.profiles.length];

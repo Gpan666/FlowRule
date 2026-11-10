@@ -1,23 +1,34 @@
-//! Windows 限速引擎：接管网络包 → 令牌桶判定 → 放行重注入 / 丢弃。
+//! Windows 限速引擎：全局句柄接管网络包 → 五元组识别进程 → 用户态令牌桶分派 → 放行/丢弃。
 //!
-//! 通过 `libloading` 在运行时动态加载 WinDivert.dll，而不是编译期链接 `.lib`：
-//! - 不需要 MSVC 生成工具，GNU 工具链同样能编译；
-//! - 驱动缺失时只是返回错误，程序不崩溃。
+//! ## 架构（WinDivert 2.2 兼容）
 //!
-//! 支持**按进程**限速：每个进程、每个方向各开一个 WinDivert 句柄，filter 里带
-//! `processId == N`。「其他流量」的 filter 会显式排除这些 pid，保证句柄之间不重叠
-//! （重叠会导致同一个包被重注入两次）。
+//! WinDivert 2.2 的 `WINDIVERT_LAYER_NETWORK` **不支持 `processId` 过滤字段**（官方文档：
+//! "this field is not supported by the WINDIVERT_LAYER_NETWORK* layers"）。实测
+//! `WinDivertHelperCompileFilter` 对含 `processId` 的表达式返回
+//! "Filter expression contains a bad token for layer"，导致 `WinDivertOpen` 必然失败。
 //!
-//! 单线程 reactor 模型：GUI 通过 channel 下发 `LimitConfig`，引擎线程 `poll` 处理一批包。
+//! 因此本引擎不再给每个程序开句柄，而是：
+//!
+//! 1. **每方向只开 1 个全局句柄**，filter 用 `Direction::base_filter()`
+//!    （`inbound/outbound and ip and (tcp or udp) and not loopback`，不含 processId）；
+//! 2. 收到包后解析 IPv4 + TCP/UDP 头得到五元组；
+//! 3. 用 [`proc_map::ProcMap`]（GetExtendedTcpTable/UdpTable owner-pid）查到 owning PID；
+//! 4. 按 [`LimitConfig`] 把 PID 映射到程序 key，选出该程序的令牌桶；未匹配则走
+//!    「其他流量」令牌桶；都没有速率限制则直接放行；
+//! 5. 令牌足够 → `WinDivertSend` 重注入并计数；不足 → 丢弃（TCP 触发拥塞控制自然降速）。
+//!
+//! 副作用是两个句柄的 filter 天然互斥（inbound vs outbound），**彻底消除了原实现
+//! 「多句柄 filter 重叠会重复注入」与 `MAX_EXCLUDES` 限制**。
+
+pub mod proc_map;
 
 use std::collections::HashMap;
-use std::ffi::{c_char, CString};
+use std::ffi::{c_char, CStr, CString};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use libloading::{Library, Symbol};
-use rl_core::{
-    build_filter, build_program_filter, ByteCounter, Direction, Engine, LimitConfig, TokenBucket,
-};
+use rl_core::{ByteCounter, Direction, Engine, LimitConfig, TokenBucket};
 
 /// WinDivert 文档定义的最大包长 = 40 + 0xFFFF
 const WINDIVERT_MTU_MAX: usize = 40 + 0xFFFF;
@@ -27,7 +38,7 @@ const QUEUE_TIME_MS: u64 = 4;
 const LAYER_NETWORK: u32 = 0;
 /// WINDIVERT_PARAM_QUEUE_TIME
 const PARAM_QUEUE_TIME: u32 = 1;
-/// 「其他流量」在统计表 / 句柄表里的键（真实 pid 不会是空字符串）
+/// 「其他流量」在统计表 / 桶表里的键（真实程序 key 不会是它）
 pub const OTHER: &str = "__other__";
 
 /// 统计维度：(程序 key 或 OTHER, 方向)
@@ -36,11 +47,17 @@ pub type StatsMap = Arc<Mutex<HashMap<StatKey, Arc<ByteCounter>>>>;
 
 /// WINDIVERT_ADDRESS：只做透传（recv 填、send 传回），不解释内部位域，
 /// 所以用定长缓冲表示，避免位域布局对不齐导致的问题。
+///
+/// ⚠️ 大小必须是 **80 字节**（windivert.h）：
+/// `INT64 Timestamp`(8) + `UINT32 位域块`(4) + `UINT32 Reserved2`(4)
+/// + 匿名 union（`UINT8 Reserved3[64]` 主导，64）= 80。
+/// 原实现写成 64 字节，`WinDivertRecv` 写入时会溢出、破坏相邻内存。
+/// 之前句柄从未打开成功（filter 含 processId 非法），recv 没被调用才没暴露。
 #[repr(C, align(8))]
 #[derive(Clone, Copy)]
-struct Address([u8; 64]);
+struct Address([u8; 80]);
 
-/// 句柄用整数表示而不是裸指针，这样 `Limiter` 天然满足 Send（要在线程间移动）
+/// 句柄用整数表示而不是裸指针，这样天然满足 Send
 type Handle = isize;
 const INVALID_HANDLE: Handle = -1;
 
@@ -49,6 +66,11 @@ type FnRecv = unsafe extern "system" fn(Handle, *mut u8, u32, *mut u32, *mut Add
 type FnSend = unsafe extern "system" fn(Handle, *const u8, u32, *mut u32, *const Address) -> i32;
 type FnClose = unsafe extern "system" fn(Handle) -> i32;
 type FnSetParam = unsafe extern "system" fn(Handle, u32, u64) -> i32;
+/// BOOL WinDivertHelperCompileFilter(LPCSTR, UINT32 layer, char* object, UINT objLen,
+///                                  const char** errorStr, UINT* errorPos)
+type FnCompileFilter = unsafe extern "system" fn(
+    *const c_char, u32, *mut c_char, u32, *mut *const c_char, *mut u32,
+) -> i32;
 
 #[derive(Clone, Copy)]
 struct Api {
@@ -57,6 +79,7 @@ struct Api {
     send: FnSend,
     close: FnClose,
     set_param: FnSetParam,
+    compile_filter: FnCompileFilter,
 }
 
 /// 加载并缓存 WinDivert 函数表（只需一次）
@@ -73,11 +96,12 @@ fn load_api() -> Result<Api, String> {
             )
         })?;
 
-        let open: Symbol<FnOpen> = symbol(&dll, b"WinDivertOpen")?;
-        let recv: Symbol<FnRecv> = symbol(&dll, b"WinDivertRecv")?;
-        let send: Symbol<FnSend> = symbol(&dll, b"WinDivertSend")?;
-        let close: Symbol<FnClose> = symbol(&dll, b"WinDivertClose")?;
-        let set_param: Symbol<FnSetParam> = symbol(&dll, b"WinDivertSetParam")?;
+        let open: Symbol<FnOpen> = symbol(&dll, b"WinDivertOpen\0")?;
+        let recv: Symbol<FnRecv> = symbol(&dll, b"WinDivertRecv\0")?;
+        let send: Symbol<FnSend> = symbol(&dll, b"WinDivertSend\0")?;
+        let close: Symbol<FnClose> = symbol(&dll, b"WinDivertClose\0")?;
+        let set_param: Symbol<FnSetParam> = symbol(&dll, b"WinDivertSetParam\0")?;
+        let compile_filter: Symbol<FnCompileFilter> = symbol(&dll, b"WinDivertHelperCompileFilter\0")?;
 
         let api = Api {
             open: *open,
@@ -85,6 +109,7 @@ fn load_api() -> Result<Api, String> {
             send: *send,
             close: *close,
             set_param: *set_param,
+            compile_filter: *compile_filter,
         };
         // 函数指针脱离 Symbol 的生命周期，必须让 DLL 常驻内存
         std::mem::forget(dll);
@@ -96,43 +121,79 @@ fn symbol<'a, T>(dll: &'a Library, name: &[u8]) -> Result<Symbol<'a, T>, String>
     unsafe { dll.get(name) }.map_err(|e| format!("找不到 {}: {e}", String::from_utf8_lossy(name)))
 }
 
-/// 一个「程序 + 方向」对应一个句柄和一个令牌桶
-struct Limiter {
+/// 打开句柄前先离线编译 filter —— 这是防止再次引入 NETWORK 层不支持字段的关键防线。
+fn validate_filter(api: &Api, filter: &str) -> Result<(), String> {
+    let expr = CString::new(filter).map_err(|_| "过滤表达式含非法字符".to_string())?;
+    let mut err_ptr: *const c_char = std::ptr::null();
+    let mut err_pos: u32 = 0;
+    let ok = unsafe {
+        (api.compile_filter)(
+            expr.as_ptr(), LAYER_NETWORK, std::ptr::null_mut(), 0,
+            &mut err_ptr, &mut err_pos,
+        )
+    };
+    if ok != 0 {
+        return Ok(());
+    }
+    let msg = if err_ptr.is_null() {
+        "未知错误".to_string()
+    } else {
+        unsafe { CStr::from_ptr(err_ptr) }.to_string_lossy().into_owned()
+    };
+    Err(format!("过滤表达式非法（位置 {err_pos}）：{msg}；表达式：{filter}"))
+}
+
+/// 把 WinDivertOpen 的 Win32 错误码翻译成可操作的中文建议。
+/// 原实现把所有失败一律归因为「请以管理员身份运行」，是误报。
+fn explain_open_error(code: i32) -> &'static str {
+    match code {
+        2 => "找不到 WinDivert64.sys 驱动文件，请确认它与 rl-app.exe 在同一目录",
+        5 => "权限不足：请右键「以管理员身份运行」本程序（或点顶部横幅的提权按钮）",
+        87 => "过滤表达式 / 参数非法（引擎内部 filter 校验未通过，属于程序缺陷）",
+        577 => "WinDivert64.sys 驱动数字签名无效，请使用官方发布包里的驱动",
+        654 => "系统已加载不兼容版本的 WinDivert 驱动，请重启电脑后重试",
+        1060 => "WinDivert 驱动服务未安装，请确认 WinDivert64.sys 存在",
+        1275 => "驱动被安全软件拦截，或当前是不支持内核驱动的虚拟化环境；请把程序加入白名单",
+        1753 => "Windows 的 Base Filtering Engine 服务被禁用，请启用 BFE 服务后重试",
+        _ => "驱动加载失败，请确认以管理员身份运行、驱动文件齐全且未被安全软件拦截",
+    }
+}
+
+/// 一个方向一个全局句柄
+struct DirHandle {
+    dir: Direction,
     handle: Handle,
-    filter: String,
-    bucket: TokenBucket,
     buf: Vec<u8>,
     addr: Address,
 }
 
-impl Limiter {
-    /// 打开句柄。`label` 只用于错误提示（程序 key 或 OTHER）
-    fn open(label: &str, direction: Direction, filter: &str, bps: u64) -> Result<Self, String> {
+impl DirHandle {
+    fn open(dir: Direction) -> Result<Self, String> {
         let api = api()?;
-        let expr = CString::new(filter).map_err(|_| "过滤表达式非法".to_string())?;
+        let filter = dir.base_filter();
+        validate_filter(api, filter)?;
 
+        let expr = CString::new(filter).map_err(|_| "过滤表达式非法".to_string())?;
         let handle = unsafe { (api.open)(expr.as_ptr(), LAYER_NETWORK, 0, 0) };
         if handle == 0 || handle == INVALID_HANDLE {
+            let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
             return Err(format!(
-                "打开 {}（{}）句柄失败，Win32 错误 {}。请以管理员身份运行，并确认 WinDivert64.sys 在程序同目录",
-                direction.label(),
-                label,
-                std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+                "打开{}全局句柄失败（Win32 错误 {code}）：{}",
+                dir.label(), explain_open_error(code)
             ));
         }
         unsafe { (api.set_param)(handle, PARAM_QUEUE_TIME, QUEUE_TIME_MS) };
 
         Ok(Self {
+            dir,
             handle,
-            filter: filter.to_string(),
-            bucket: TokenBucket::new(bps),
             buf: vec![0u8; WINDIVERT_MTU_MAX],
-            addr: Address([0; 64]),
+            addr: Address([0; 80]),
         })
     }
 
-    /// 收一个包并判定；返回是否真的处理了一个包
-    fn step(&mut self, counter: &ByteCounter) -> Result<bool, String> {
+    /// 收一个包，返回包长；0 表示本轮没包（队列超时）
+    fn recv(&mut self) -> Result<usize, String> {
         let api = api()?;
         let mut len: u32 = 0;
         let ok = unsafe {
@@ -145,32 +206,35 @@ impl Limiter {
             )
         };
         if ok == 0 {
-            return Ok(false); // 队列超时，本轮没包
+            // QUEUE_TIME(4ms) 到期、队列为空时 WinDivertRecv 返回 FALSE，
+            // 这是「本轮没包」而不是错误（与原实现一致）。
+            return Ok(0);
         }
-        let len = len as usize;
+        Ok(len as usize)
+    }
 
-        if self.bucket.try_consume(len as u64) {
-            let mut sent: u32 = 0;
-            let ok = unsafe {
-                (api.send)(
-                    self.handle,
-                    self.buf.as_ptr(),
-                    len as u32,
-                    &mut sent,
-                    &self.addr,
-                )
-            };
-            if ok == 0 {
-                return Err("重注入失败".to_string());
-            }
-            counter.add(len as u64);
+    /// 原样重注入（校验和由驱动处理）
+    fn reinject(&mut self, len: usize) -> Result<(), String> {
+        let api = api()?;
+        let mut sent: u32 = 0;
+        let ok = unsafe {
+            (api.send)(
+                self.handle,
+                self.buf.as_ptr(),
+                len as u32,
+                &mut sent,
+                &self.addr,
+            )
+        };
+        if ok == 0 {
+            let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            return Err(format!("重注入失败（Win32 错误 {code}）"));
         }
-        // 令牌不足直接丢弃：TCP 触发拥塞控制自然降速，UDP 直接丢
-        Ok(true)
+        Ok(())
     }
 }
 
-impl Drop for Limiter {
+impl Drop for DirHandle {
     fn drop(&mut self) {
         if let Ok(api) = api() {
             unsafe { (api.close)(self.handle) };
@@ -178,23 +242,123 @@ impl Drop for Limiter {
     }
 }
 
+/// 从 IPv4 包解析五元组。返回 `(src, sport, dst, dport, is_tcp)`。
+///
+/// - filter 含 `ip` 且 `tcp or udp`，所以只会收到 IPv4 TCP/UDP 包；
+/// - 非首片 IP 分片没有端口信息，返回 None → 归入「其他流量」兜底；
+/// - 端口按网络字节序读出（主机序 u16），与 proc_map 的 `mib_port` 一致；
+/// - 地址按 `from_ne_bytes` 读 4 字节，与 MIB 结构里 DWORD 的原生布局一致。
+pub fn parse_tuple(pkt: &[u8]) -> Option<(u32, u16, u32, u16, bool)> {
+    if pkt.len() < 20 {
+        return None;
+    }
+    let ver_ihl = pkt[0];
+    if ver_ihl >> 4 != 4 {
+        return None; // 不是 IPv4
+    }
+    let ihl = ((ver_ihl & 0x0f) as usize) * 4;
+    if ihl < 20 || pkt.len() < ihl + 4 {
+        return None;
+    }
+    let proto = pkt[9];
+    let is_tcp = match proto {
+        6 => true,
+        17 => false,
+        _ => return None,
+    };
+    // 非首片分片（fragment offset != 0）没有传输层头
+    let frag = u16::from_be_bytes([pkt[6], pkt[7]]);
+    if frag & 0x1fff != 0 {
+        return None;
+    }
+    let src = u32::from_ne_bytes([pkt[12], pkt[13], pkt[14], pkt[15]]);
+    let dst = u32::from_ne_bytes([pkt[16], pkt[17], pkt[18], pkt[19]]);
+    let sport = u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]);
+    let dport = u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]);
+    Some((src, sport, dst, dport, is_tcp))
+}
+
+/// 判断一个包归属哪个程序 key（找不到就归 OTHER）
+fn classify(
+    pm: &proc_map::ProcMap,
+    pid_key: &HashMap<(u32, Direction), String>,
+    pkt: &[u8],
+    dir: Direction,
+) -> String {
+    let tup = match parse_tuple(pkt) {
+        Some(t) => t,
+        None => return OTHER.to_string(),
+    };
+    let outbound = dir == Direction::Up;
+    pm.lookup_pid(tup.0, tup.1, tup.2, tup.3, tup.4, outbound)
+        .and_then(|pid| pid_key.get(&(pid, dir)).cloned())
+        .unwrap_or_else(|| OTHER.to_string())
+}
+
+/// 选桶：优先程序专属桶，其次「其他流量」桶，都没有返回 None（=不限速）
+fn pick_bucket(
+    buckets: &HashMap<StatKey, TokenBucket>,
+    key: &str,
+    dir: Direction,
+) -> Option<StatKey> {
+    let own = (key.to_string(), dir);
+    if buckets.contains_key(&own) {
+        return Some(own);
+    }
+    let other = (OTHER.to_string(), dir);
+    if buckets.contains_key(&other) {
+        return Some(other);
+    }
+    None
+}
+
 pub struct WinDivertEngine {
-    limiters: HashMap<StatKey, Limiter>,
-    /// 轮询顺序，避免每轮重新收集 keys
-    order: Vec<StatKey>,
+    /// 两个全局句柄；为空表示当前没有任何限速规则（不接管流量）
+    handles: Vec<DirHandle>,
+    /// (程序key|OTHER, 方向) -> 令牌桶
+    buckets: HashMap<StatKey, TokenBucket>,
+    /// (PID, 方向) -> 程序 key。只登记该方向确实设了限速的程序，
+    /// 否则未在该方向单独限速的程序应走「其他流量」桶。
+    pid_key: HashMap<(u32, Direction), String>,
+    /// 本地快取，避免每个包都锁共享 stats
+    counters: HashMap<StatKey, Arc<ByteCounter>>,
     stats: StatsMap,
     config: LimitConfig,
-    /// 上一次 apply 的非致命提示（如「其他流量」因进程太多被暂停）
+    proc_map: proc_map::ProcMap,
+    /// 上一次的「速率签名」（不含 pids）：pids 每 3 秒刷新，只有速率真变了才重建桶
+    rate_sig: Option<(Vec<(String, u64, u64)>, u64, u64)>,
     warning: Option<String>,
+}
+
+/// 速率签名：故意不含 pids。进程扫描导致 pids 变化时不应打断令牌桶或清空曲线。
+fn rate_signature(config: &LimitConfig) -> (Vec<(String, u64, u64)>, u64, u64) {
+    let mut v: Vec<(String, u64, u64)> = config
+        .rules
+        .iter()
+        .filter(|r| r.is_active())
+        .map(|r| (r.key.clone(), r.down_bps, r.up_bps))
+        .collect();
+    v.sort();
+    (v, config.other_down_bps, config.other_up_bps)
+}
+
+impl Default for WinDivertEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WinDivertEngine {
     pub fn new() -> Self {
         Self {
-            limiters: HashMap::new(),
-            order: Vec::new(),
+            handles: Vec::new(),
+            buckets: HashMap::new(),
+            pid_key: HashMap::new(),
+            counters: HashMap::new(),
             stats: Arc::new(Mutex::new(HashMap::new())),
             config: LimitConfig::unlimited(),
+            proc_map: proc_map::ProcMap::new(),
+            rate_sig: Some(rate_signature(&LimitConfig::unlimited())),
             warning: None,
         }
     }
@@ -208,171 +372,142 @@ impl WinDivertEngine {
         &self.config
     }
 
-    /// 上一次 apply 的非致命提示（None 表示一切正常）
+    /// 当前非致命提示（连接表读取失败 / 规则被跳过等）
     pub fn warning(&self) -> Option<&str> {
         self.warning.as_deref()
     }
 
-    /// 根据配置算出「应该存在哪些句柄」：key -> (filter, 速率)，外加非致命提示。
-    ///
-    /// - 每个限速程序一个句柄（上下行各一个），filter 用 `(pid or pid ...)` 合并所有进程；
-    /// - 「其他流量」每个方向一个句柄，filter 只能排除**该方向**已覆盖的进程，
-    ///   否则没被覆盖的那部分流量会被两个句柄同时收到 → 重复注入。
-    ///   进程太多排除不下时宁可暂停「其他流量」限速，也要保证程序限速正确生效。
-    fn wanted(
-        &self,
-        cfg: &LimitConfig,
-    ) -> Result<(HashMap<StatKey, (String, u64)>, Option<String>), String> {
-        let mut want: HashMap<StatKey, (String, u64)> = HashMap::new();
-        let mut covered_down: Vec<u32> = Vec::new();
-        let mut covered_up: Vec<u32> = Vec::new();
+    /// 依据配置重建 pid→key、令牌桶，并按需开关全局句柄。
+    fn rebuild(&mut self, config: &LimitConfig) -> Result<(), String> {
+        // 期望的 (StatKey, 速率)；同时另建 pid→key 映射
+        let mut desired: HashMap<StatKey, u64> = HashMap::new();
+        let mut pid_key: HashMap<(u32, Direction), String> = HashMap::new();
         let mut notes: Vec<String> = Vec::new();
 
-        for r in cfg.active_rules() {
+        for r in config.active_rules() {
             let pids = r.normalized_pids();
             if pids.is_empty() {
                 notes.push(format!("程序 {} 当前没有活动进程，未限速", r.key));
                 continue;
             }
             if r.down_bps > 0 {
-                match build_program_filter(Direction::Down, &pids) {
-                    Ok((f, cov)) => {
-                        want.insert((r.key.clone(), Direction::Down), (f, r.down_bps));
-                        covered_down.extend(cov);
-                    }
-                    Err(e) => notes.push(format!("程序 {} 下行未限速：{}", r.key, e)),
+                desired.insert((r.key.clone(), Direction::Down), r.down_bps);
+                for pid in &pids {
+                    pid_key.insert((*pid, Direction::Down), r.key.clone());
                 }
             }
             if r.up_bps > 0 {
-                match build_program_filter(Direction::Up, &pids) {
-                    Ok((f, cov)) => {
-                        want.insert((r.key.clone(), Direction::Up), (f, r.up_bps));
-                        covered_up.extend(cov);
-                    }
-                    Err(e) => notes.push(format!("程序 {} 上行未限速：{}", r.key, e)),
+                desired.insert((r.key.clone(), Direction::Up), r.up_bps);
+                for pid in &pids {
+                    pid_key.insert((*pid, Direction::Up), r.key.clone());
                 }
             }
         }
-
-        add_other(
-            Direction::Down,
-            cfg.other_down_bps,
-            &mut covered_down,
-            &mut want,
-            &mut notes,
-        );
-        add_other(
-            Direction::Up,
-            cfg.other_up_bps,
-            &mut covered_up,
-            &mut want,
-            &mut notes,
-        );
-
-        Ok((want, notes.into_iter().next()))
-    }
-}
-
-/// 「其他流量」句柄：排除本方向已覆盖的进程后才打开，保证不与程序句柄重叠。
-fn add_other(
-    dir: Direction,
-    bps: u64,
-    covered: &mut Vec<u32>,
-    want: &mut HashMap<StatKey, (String, u64)>,
-    notes: &mut Vec<String>,
-) {
-    if bps == 0 {
-        return;
-    }
-    covered.sort_unstable();
-    covered.dedup();
-    if covered.len() > rl_core::process::MAX_EXCLUDES {
-        notes.push(format!(
-            "单独限速的程序覆盖进程过多（>{} 个），已暂停「其他流量」的{}限速",
-            rl_core::process::MAX_EXCLUDES,
-            dir.label()
-        ));
-        return;
-    }
-    match build_filter(dir, None, covered) {
-        Ok(f) => {
-            want.insert((OTHER.to_string(), dir), (f, bps));
+        if config.other_down_bps > 0 {
+            desired.insert((OTHER.to_string(), Direction::Down), config.other_down_bps);
         }
-        Err(e) => notes.push(format!("「其他流量」{}未限速：{}", dir.label(), e)),
-    }
-}
+        if config.other_up_bps > 0 {
+            desired.insert((OTHER.to_string(), Direction::Up), config.other_up_bps);
+        }
 
-impl Default for WinDivertEngine {
-    fn default() -> Self {
-        Self::new()
+        // pid→key 每次都要更新：浏览器开新标签页、进程退出都会改变归属
+        self.pid_key = pid_key;
+
+        let sig = rate_signature(config);
+        let rates_changed = self.rate_sig.as_ref() != Some(&sig);
+        if rates_changed {
+            // 复用已有桶并仅更新速率，避免每 3 秒把令牌重置为满、曲线清零
+            self.buckets.retain(|k, _| desired.contains_key(k));
+            for (k, rate) in desired {
+                match self.buckets.get_mut(&k) {
+                    Some(old) => old.set_rate(rate),
+                    None => { self.buckets.insert(k, TokenBucket::new(rate)); }
+                }
+            }
+            self.rate_sig = Some(sig);
+        }
+
+        // 没有任何限速 → 关闭全部句柄，让流量完全不经过用户态（暂停后瞬时恢复满速）
+        if self.buckets.is_empty() {
+            self.handles.clear();
+        } else if self.handles.is_empty() {
+            let down = DirHandle::open(Direction::Down)?;
+            let up = DirHandle::open(Direction::Up).map_err(|e| format!("{e}"))?;
+            self.handles.push(down);
+            self.handles.push(up);
+        }
+
+        self.warning = notes.into_iter().next();
+        Ok(())
     }
 }
 
 impl Engine for WinDivertEngine {
     fn apply(&mut self, config: LimitConfig) -> Result<(), String> {
-        self.warning = None;
         if config == self.config {
             return Ok(());
         }
-        let (want, warning) = self.wanted(&config)?;
-        self.warning = warning;
-
-        // 不再需要的句柄关掉（Drop 里会 close）
-        self.limiters.retain(|k, _| want.contains_key(k));
-
-        // filter 变了必须重开：否则「其他流量」会和程序句柄重叠，导致重复注入
-        let stale: Vec<StatKey> = self
-            .limiters
-            .iter()
-            .filter(|(k, l)| want[*k].0 != l.filter)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for k in stale {
-            self.limiters.remove(&k);
-        }
-
-        for (key, (filter, bps)) in want {
-            match self.limiters.get_mut(&key) {
-                Some(l) => l.bucket.set_rate(bps),
-                None => {
-                    let (ref label, dir) = key;
-                    let limiter = Limiter::open(label, dir, &filter, bps)?;
-                    self.limiters.insert(key.clone(), limiter);
-                    self.stats
-                        .lock()
-                        .unwrap()
-                        .entry(key)
-                        .or_insert_with(|| Arc::new(ByteCounter::new()));
-                }
-            }
-        }
-        // 清掉已停用的统计项
-        self.stats.lock().unwrap().retain(|k, _| self.limiters.contains_key(k));
-
-        let mut order: Vec<StatKey> = self.limiters.keys().cloned().collect();
-        order.sort();
-        self.order = order;
+        // 先重建；失败时不更新 self.config，下一轮会重试
+        self.rebuild(&config)?;
         self.config = config;
         Ok(())
     }
 
-    /// 所有句柄轮流处理，保证公平；每轮最多 max_packets 个包
+    /// 轮询两个全局句柄，最多处理 max_packets 个包。
     fn poll(&mut self, max_packets: usize) -> Result<usize, String> {
+        if self.handles.is_empty() {
+            return Ok(0);
+        }
+        self.proc_map.refresh_if_due(Instant::now());
+
         let mut handled = 0;
         for _ in 0..max_packets {
             let mut idle = true;
-            for key in self.order.clone() {
-                let counter = self.stats.lock().unwrap().get(&key).cloned();
-                if let (Some(limiter), Some(counter)) = (self.limiters.get_mut(&key), counter) {
-                    if limiter.step(&counter)? {
-                        idle = false;
-                        handled += 1;
-                    }
+            for i in 0..self.handles.len() {
+                let h = &mut self.handles[i];
+                let len = h.recv()?;
+                if len == 0 {
+                    continue;
                 }
+                idle = false;
+                handled += 1;
+                let dir = h.dir;
+
+                let key = classify(&self.proc_map, &self.pid_key, &h.buf[..len], dir);
+                let bucket_key = pick_bucket(&self.buckets, &key, dir);
+                let pass = match &bucket_key {
+                    Some(bk) => self.buckets.get_mut(bk).map(|b| b.try_consume(len as u64)).unwrap_or(true),
+                    None => true,
+                };
+
+                if pass {
+                    h.reinject(len)?;
+                    // 统计用「程序 key」而非实际桶：界面上该程序能看到自己的实时速率，
+                    // 即使它走的是「其他流量」兜底。
+                    let sk = (key, dir);
+                    let counter = match self.counters.get(&sk) {
+                        Some(c) => c.clone(),
+                        None => {
+                            let c = Arc::new(ByteCounter::new());
+                            self.counters.insert(sk.clone(), c.clone());
+                            if let Ok(mut m) = self.stats.lock() {
+                                m.insert(sk.clone(), c.clone());
+                            }
+                            c
+                        }
+                    };
+                    counter.add(len as u64);
+                }
+                // 令牌不足：直接不重注入（丢弃），TCP 触发拥塞控制自然降速
             }
             if idle {
                 break;
             }
+        }
+
+        // 连接表读取失败属于非致命降级：仍能全局限速，但按进程分派不准
+        if let Some(e) = self.proc_map.last_error() {
+            self.warning = Some(format!("进程识别不可用（{}），按程序限速可能不准确", e));
         }
         Ok(handled)
     }
@@ -394,86 +529,112 @@ impl Engine for NoopEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rl_core::{LimitConfig, ProgramRule};
 
-    fn prog(key: &str, pids: Vec<u32>, down: u64, up: u64) -> ProgramRule {
-        ProgramRule { key: key.to_string(), pids, down_bps: down, up_bps: up }
-    }
-
-    fn has<'a>(want: &'a HashMap<StatKey, (String, u64)>, key: &str, dir: Direction) -> Option<&'a str> {
-        want.get(&(key.to_string(), dir)).map(|(f, _)| f.as_str())
-    }
-
-    #[test]
-    fn program_handle_union_and_other_excludes_them() {
-        let e = WinDivertEngine::new();
-        let cfg = LimitConfig {
-            rules: vec![prog("chrome", vec![200, 100], 1024, 0)],
-            other_down_bps: 2048,
-            other_up_bps: 0,
-        };
-        let (want, warning) = e.wanted(&cfg).unwrap();
-        assert!(warning.is_none());
-
-        let pf = has(&want, "chrome", Direction::Down).unwrap();
-        assert!(pf.contains("processId == 100") && pf.contains("processId == 200"));
-        assert!(pf.contains(" or "), "同一程序的多个进程应该用 or 合并");
-        assert!(has(&want, "chrome", Direction::Up).is_none(), "上行未限速则不开句柄");
-
-        let of = has(&want, OTHER, Direction::Down).unwrap();
-        assert!(of.contains("processId != 100") && of.contains("processId != 200"));
-        assert!(has(&want, OTHER, Direction::Up).is_none());
+    fn ipv4_tcp(src: [u8; 4], sport: u16, dst: [u8; 4], dport: u16, proto: u8) -> Vec<u8> {
+        let mut p = vec![0u8; 40];
+        p[0] = 0x45; // IPv4, IHL=5 (20 bytes)
+        p[2..4].copy_from_slice(&40u16.to_be_bytes());
+        p[6..8].copy_from_slice(&0u16.to_be_bytes()); // 无分片
+        p[9] = proto;
+        p[12..16].copy_from_slice(&src);
+        p[16..20].copy_from_slice(&dst);
+        p[20..22].copy_from_slice(&sport.to_be_bytes());
+        p[22..24].copy_from_slice(&dport.to_be_bytes());
+        p
     }
 
     #[test]
-    fn other_up_does_not_exclude_down_only_program() {
-        // 程序只限下行：它的上行流量必须仍由「其他流量:上行」接管，否则没人重注入
-        let e = WinDivertEngine::new();
-        let cfg = LimitConfig {
-            rules: vec![prog("app", vec![7, 8], 1024, 0)],
-            other_down_bps: 0,
-            other_up_bps: 1024,
-        };
-        let (want, _) = e.wanted(&cfg).unwrap();
+    fn parses_ipv4_tcp_tuple() {
+        let p = ipv4_tcp([192, 168, 1, 2], 50000, [10, 0, 0, 1], 443, 6);
+        let (src, sport, dst, dport, is_tcp) = parse_tuple(&p).unwrap();
+        assert_eq!(sport, 50000);
+        assert_eq!(dport, 443);
+        assert!(is_tcp);
+        assert_eq!(src, u32::from_ne_bytes([192, 168, 1, 2]));
+        assert_eq!(dst, u32::from_ne_bytes([10, 0, 0, 1]));
+    }
 
-        let ou = has(&want, OTHER, Direction::Up).unwrap();
-        assert!(
-            !ou.contains("processId !="),
-            "只限下行的程序，其上行必须留给其他流量，不能排除"
+    #[test]
+    fn parses_udp_and_rejects_fragment() {
+        let p = ipv4_tcp([1, 2, 3, 4], 5353, [5, 6, 7, 8], 53, 17);
+        assert!(!parse_tuple(&p).unwrap().4);
+
+        let mut frag = p.clone();
+        frag[6..8].copy_from_slice(&0x2001u16.to_be_bytes()); // offset != 0
+        assert!(parse_tuple(&frag).is_none());
+    }
+
+    #[test]
+    fn rejects_short_or_non_ipv4() {
+        assert!(parse_tuple(&[0u8; 10]).is_none());
+        let mut p = ipv4_tcp([1, 2, 3, 4], 80, [5, 6, 7, 8], 80, 6);
+        p[0] = 0x65; // IPv6
+        assert!(parse_tuple(&p).is_none());
+    }
+
+    #[test]
+    fn base_filters_never_contain_process_id() {
+        // 回归防线：NETWORK 层不支持 processId，一旦再引入就会让 WinDivertOpen 报 87
+        for d in Direction::ALL {
+            assert!(!d.base_filter().contains("processId"), "{}", d.label());
+        }
+    }
+
+    #[test]
+    fn bucket_precedence_program_then_other() {
+        let mut buckets = HashMap::new();
+        buckets.insert((OTHER.to_string(), Direction::Down), TokenBucket::new(1024));
+        assert_eq!(
+            pick_bucket(&buckets, "chrome", Direction::Down),
+            Some((OTHER.to_string(), Direction::Down))
         );
-        let pd = has(&want, "app", Direction::Down).unwrap();
-        assert!(pd.contains("processId == 7") && pd.contains("processId == 8"));
-        assert!(has(&want, OTHER, Direction::Down).is_none(), "其他流量下行未限速则不开句柄");
+        buckets.insert(("chrome".to_string(), Direction::Down), TokenBucket::new(2048));
+        assert_eq!(
+            pick_bucket(&buckets, "chrome", Direction::Down),
+            Some(("chrome".to_string(), Direction::Down))
+        );
+        assert_eq!(pick_bucket(&buckets, "chrome", Direction::Up), None);
     }
 
     #[test]
-    fn other_dropped_when_too_many_pids() {
-        let e = WinDivertEngine::new();
-        let rules: Vec<ProgramRule> = (0..25)
-            .map(|i| prog(&format!("p{i}"), vec![1000 + i], 1024, 1024))
-            .collect();
-        let cfg = LimitConfig {
-            rules,
-            other_down_bps: 2048,
-            other_up_bps: 2048,
-        };
-        let (want, warning) = e.wanted(&cfg).unwrap();
-        assert_eq!(want.len(), 50, "程序句柄必须全部照常打开");
-        assert!(has(&want, OTHER, Direction::Down).is_none());
-        assert!(has(&want, OTHER, Direction::Up).is_none());
-        assert!(warning.unwrap().contains("其他流量"));
+    fn classify_maps_pid_to_program_key() {
+        let mut pm = proc_map::ProcMap::new();
+        let mut tcp = HashMap::new();
+        tcp.insert((1, 1000, 2, 80), 4242);
+        tcp.insert((2, 80, 1, 1000), 4242);
+        pm.seed_for_test(tcp, HashMap::new());
+        let mut pid_key = HashMap::new();
+        pid_key.insert((4242, Direction::Up), "chrome".to_string());
+
+        let pkt = ipv4_tcp([1, 1, 1, 1], 1000, [2, 2, 2, 2], 80, 6);
+        // 表里的地址是数值 1/2，与包的 [1,1,1,1] 不一致 → 落到 OTHER
+        assert_eq!(classify(&pm, &pid_key, &pkt, Direction::Up), OTHER);
+
+        let addr_a = 1u32.to_ne_bytes();
+        let addr_b = 2u32.to_ne_bytes();
+        let pkt2 = ipv4_tcp(addr_a, 1000, addr_b, 80, 6);
+        assert_eq!(classify(&pm, &pid_key, &pkt2, Direction::Up), "chrome");
     }
 
     #[test]
-    fn empty_pids_reports_note() {
-        let e = WinDivertEngine::new();
-        let cfg = LimitConfig {
-            rules: vec![prog("dead", vec![], 1024, 0)],
-            other_down_bps: 0,
-            other_up_bps: 0,
-        };
-        let (want, warning) = e.wanted(&cfg).unwrap();
-        assert!(want.is_empty());
-        assert!(warning.unwrap().contains("没有活动进程"));
+    fn pid_map_only_registers_limited_direction() {
+        // 只限下行的程序，其上行流量必须走「其他流量」桶，不能被当成程序专属桶
+        let mut pid_key = HashMap::new();
+        pid_key.insert((4242, Direction::Down), "chrome".to_string());
+        let mut buckets = HashMap::new();
+        buckets.insert(("chrome".to_string(), Direction::Down), TokenBucket::new(1024));
+        buckets.insert((OTHER.to_string(), Direction::Up), TokenBucket::new(2048));
+        assert_eq!(
+            pick_bucket(&buckets, &classify_placeholder(&pid_key, 4242, Direction::Up), Direction::Up),
+            Some((OTHER.to_string(), Direction::Up))
+        );
+    }
+
+    fn classify_placeholder(
+        pid_key: &HashMap<(u32, Direction), String>,
+        pid: u32,
+        dir: Direction,
+    ) -> String {
+        pid_key.get(&(pid, dir)).cloned().unwrap_or_else(|| OTHER.to_string())
     }
 }

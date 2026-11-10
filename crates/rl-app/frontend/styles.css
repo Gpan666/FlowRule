@@ -223,6 +223,13 @@ h1, h2 { margin: 0; }
   max-width: 320px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .status-pill.error { background: color-mix(in srgb, var(--danger) 13%, transparent); color: var(--danger); }
+/* 错误态要能看到完整诊断（含 Win32 错误码），不能再被 ellipsis 截断 */
+.status-pill.error, .warning-pill.long {
+  max-width: 460px; white-space: normal; overflow: visible;
+  text-overflow: clip; border-radius: 16px; line-height: 1.5;
+  align-items: flex-start; text-align: left;
+}
+.status-pill.error .pulse, .warning-pill.long .pulse { margin-top: 5px; }
 .warning-pill { background: color-mix(in srgb, var(--up) 15%, transparent); color: var(--up); }
 .pulse { width: 7px; height: 7px; border-radius: 50%; background: currentColor; flex: none; box-shadow: 0 0 0 4px color-mix(in srgb, currentColor 20%, transparent); }
 

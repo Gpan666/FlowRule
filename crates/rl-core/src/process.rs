@@ -1,21 +1,16 @@
-//! 进程级限速的数据模型与过滤规则构造。
+//! 进程级限速的数据模型（纯逻辑，无平台依赖）。
 //!
-//! 一个"程序"（同一个可执行文件）通常有多个进程：浏览器一个标签页一个进程，
+//! 一个「程序」（同一个可执行文件）通常有多个进程：浏览器一个标签页一个进程，
 //! 用户要限的是「这个程序」，不是其中某一个 pid。
 //! 因此模型以**程序**为单位：用可执行文件路径作为分组键，限速规则携带该程序当前的
-//! 所有 pid，引擎用 `(processId == A or processId == B ...)` 把它们合成一个句柄、共用
-//! 一个令牌桶 —— 限速值就是整个程序的带宽预算。
+//! 所有 pid，每个方向一个令牌桶 —— 限速值就是整个程序的带宽预算。
 //!
-//! 关键约束：**多个句柄的 filter 不能重叠**，否则同一个包会被多个句柄各重注入一次。
-//! 因此「其他流量」的 filter 必须**逐方向**排除掉「该方向已被单独限速的程序」覆盖的 pid。
+//! 早期版本会给每个程序拼 `processId == N` 的 WinDivert filter，但 WinDivert 2.2 的
+//! NETWORK 层不支持该字段（见 rl-engine-win::proc_map 的说明），现已改为：
+//! 引擎只开两个全局句柄，收包后用五元组 + 系统连接表在**用户态**判定归属程序。
+//! 所以本模块只负责数据模型，不再构造任何过滤表达式。
 
-use crate::Direction;
 use std::collections::HashMap;
-
-/// WinDivert filter 表达式的实测上限（保守取 1024）
-pub const FILTER_MAX_LEN: usize = 1024;
-/// 「其他流量」最多能排除多少个进程（超出则表达式会超长）
-pub const MAX_EXCLUDES: usize = 24;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessInfo {
@@ -146,102 +141,17 @@ impl LimitConfig {
     }
 }
 
-/// 构造「其他流量」的 filter：`base and processId != p1 and processId != p2 ...`
-pub fn build_filter(dir: Direction, pid: Option<u32>, exclude: &[u32]) -> Result<String, String> {
-    let _ = pid; // 保留参数以兼容旧签名；pid 维度已交给 build_program_filter
-    let mut f = dir.base_filter().to_string();
-
-    for p in exclude.iter().take(MAX_EXCLUDES) {
-        f.push_str(&format!(" and processId != {}", p));
-    }
-    if exclude.len() > MAX_EXCLUDES {
-        return Err(format!(
-            "单独限速的进程超过 {} 个，无法再对「其他流量」限速。请减少程序规则数量。",
-            MAX_EXCLUDES
-        ));
-    }
-
-    if f.len() > FILTER_MAX_LEN {
-        return Err(format!("filter 表达式过长（{} > {}）", f.len(), FILTER_MAX_LEN));
-    }
-    Ok(f)
-}
-
-/// 把一个程序的多个进程合成一个 filter：
-/// `base and (processId == A or processId == B ...)`
-///
-/// 由于 filter 长度有上限，会按给定顺序（调用方应为升序）尽量多覆盖，
-/// 返回**实际覆盖**的 pid 列表 —— 调用方必须把这份列表同步排除到「其他流量」的
-/// filter 里，否则会出现句柄重叠、重复注入。
-pub fn build_program_filter(dir: Direction, pids: &[u32]) -> Result<(String, Vec<u32>), String> {
-    let mut f = dir.base_filter().to_string();
-    f.push_str(" and (");
-
-    let mut covered: Vec<u32> = Vec::new();
-    for p in pids {
-        let piece = if covered.is_empty() {
-            format!("processId == {}", p)
-        } else {
-            format!(" or processId == {}", p)
-        };
-        // 预留一个字符给收尾的 ')'
-        if f.len() + piece.len() + 1 > FILTER_MAX_LEN {
-            break;
-        }
-        f.push_str(&piece);
-        covered.push(*p);
-    }
-    f.push(')');
-
-    if covered.is_empty() {
-        return Err(format!(
-            "程序的进程数过多，{} 方向无法构造过滤器",
-            dir.label()
-        ));
-    }
-    if f.len() > FILTER_MAX_LEN {
-        return Err(format!("filter 表达式过长（{} > {}）", f.len(), FILTER_MAX_LEN));
-    }
-    Ok((f, covered))
-}
+// ⚠️ 曾经这里有 build_filter / build_program_filter，会给每个程序拼
+// `processId == N` 的 WinDivert filter。但 WinDivert 2.2 的 NETWORK 层根本不支持
+// processId，这些表达式一律编译失败、WinDivertOpen 报 87。
+// 现已整体移除：进程归属改由 rl-engine-win::proc_map 在用户态用五元组判定，
+// 引擎只开两个不含任何进程条件的全局句柄。相关常量 FILTER_MAX_LEN/MAX_EXCLUDES
+// 也随之废弃。回归防线见 tools/check_filter.py 与 rl-engine-win 的
+// `base_filters_never_contain_process_id` 单测。
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn single_process_filter_contains_pid() {
-        let (f, cov) = build_program_filter(Direction::Down, &[4242]).unwrap();
-        assert!(f.starts_with("inbound"));
-        assert!(f.contains("processId == 4242"));
-        assert_eq!(cov, vec![4242]);
-    }
-
-    #[test]
-    fn program_filter_unions_pids() {
-        let (f, cov) = build_program_filter(Direction::Up, &[10, 20, 30]).unwrap();
-        assert!(f.starts_with("outbound"));
-        assert!(f.contains("processId == 10 and".to_string().as_str()) || f.contains("processId == 10 or"));
-        assert!(f.contains("processId == 20"));
-        assert!(f.contains("processId == 30"));
-        assert_eq!(cov, vec![10, 20, 30]);
-    }
-
-    #[test]
-    fn program_filter_covered_within_limit() {
-        // 7 位 pid 的最坏情况也要控制在 filter 上限内，且覆盖数尽量多
-        let many: Vec<u32> = (0..200).map(|i| 9_000_000 - i * 7).collect();
-        let (f, cov) = build_program_filter(Direction::Down, &many).unwrap();
-        assert!(f.len() <= FILTER_MAX_LEN);
-        assert!(!cov.is_empty());
-        // 覆盖的一定是传入列表的前缀
-        assert_eq!(cov, many[..cov.len()].to_vec());
-    }
-
-    #[test]
-    fn program_filter_empty_is_error() {
-        assert!(build_program_filter(Direction::Down, &[]).is_err());
-    }
 
     #[test]
     fn program_key_prefers_path_and_lowercases() {
@@ -266,28 +176,6 @@ mod tests {
         assert_eq!(chrome.pids, vec![1, 2]);
         let a = groups.iter().find(|g| g.name == "a.exe").unwrap();
         assert_eq!(a.key, "name::a.exe");
-    }
-
-    #[test]
-    fn other_filter_excludes_pids() {
-        let f = build_filter(Direction::Up, None, &[10, 20]).unwrap();
-        assert!(f.starts_with("outbound"));
-        assert!(f.contains("processId != 10"));
-        assert!(f.contains("processId != 20"));
-        assert!(!f.contains("processId =="));
-    }
-
-    #[test]
-    fn too_many_excludes_is_error() {
-        let many: Vec<u32> = (0..MAX_EXCLUDES as u32 + 1).collect();
-        assert!(build_filter(Direction::Down, None, &many).is_err());
-    }
-
-    #[test]
-    fn filter_length_within_limit() {
-        let many: Vec<u32> = (0..MAX_EXCLUDES as u32).collect();
-        let f = build_filter(Direction::Down, None, &many).unwrap();
-        assert!(f.len() <= FILTER_MAX_LEN);
     }
 
     #[test]
