@@ -100,6 +100,26 @@ cargo build --release --workspace
 > 注：本项目通过 `.cargo/config.toml` 把编译输出目录重定向到纯英文路径，
 > 因为 GNU 工具链的 `ld` 无法处理含中文的项目目录。
 
+### CNB 自动构建（.cnb.yml）
+
+仓库根目录的 `.cnb.yml` 配置了 CNB 云原生构建流水线：
+
+| 触发 | 行为 |
+|---|---|
+| PR 合并进 `main`（`pull_request.merged`） | 在 Windows 构建节点编译 exe，打包 zip 作为**提交附件** |
+| 直接推 `main`（`push`） | 同上 |
+| 推送 `v*` Tag（`tag_push`） | 编译 exe，**创建 Release** 并附上 zip |
+
+构建走**自托管 Windows 节点**（CNB 公共节点全是 Linux，无法直接产出 Windows exe）：
+
+1. 根组织「tsbyj.666 → 组织设置 → 构建节点」接入一台 Windows 机器，标签至少包含 `windows`
+2. 构建机需准备：Rust（`stable-x86_64-pc-windows-msvc`）、Visual Studio Build Tools
+   （工作负载「使用 C++ 的桌面开发」，提供 `link.exe`）、git
+3. 流水线脚本：`tools/ci/build-win.ps1`（构建打包）、`tools/ci/upload-artifact.ps1`（上传附件）
+
+> 自托管节点默认不开启 Docker，因此附件上传直接走 CNB OpenAPI，而不是 `cnbcool/attachments` 插件。
+> 脚本会把源码用 `git archive` 导出到 `%TEMP%` 下的纯 ASCII 目录再编译，规避中文路径导致的链接失败。
+
 ## 🚀 运行
 
 1. 确保 `rl-app.exe` 与以下文件**同目录**：

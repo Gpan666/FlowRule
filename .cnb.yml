@@ -1,0 +1,76 @@
+# CNB 云原生构建流水线 —— 流律（liulv-ratelimiter）
+#
+# 目标：合并到 main 后自动在 Windows 上编译出 rl-app.exe，并作为「提交附件」可下载；
+#       推送 v* Tag 时额外创建 Release 并附上 zip。
+#
+# ── 为什么用自托管 Windows 节点 ──────────────────────────────────────────────
+#   本项目是 Windows 桌面程序（Tauri + WebView2 + WinDivert 驱动），
+#   CNB 公共构建节点全是 Linux，无法直接产出 Windows exe。
+#   因此在根组织「tsbyj.666 → 组织设置 → 构建节点」接入一台 Windows 机器，
+#   并给它打上 `windows` 标签；流水线用 runner.namespace: group + tags: windows
+#   把任务调度到该机器上直接跑 cargo build --release。
+#
+# ── 构建机一次性准备 ────────────────────────────────────────────────────────
+#   1. Rust 工具链 stable-x86_64-pc-windows-msvc（脚本检测不到 cargo 会自动装 rustup）
+#   2. Visual Studio Build Tools →「使用 C++ 的桌面开发」（提供 link.exe 与 Windows SDK）
+#   3. git（CNB 节点基础依赖）
+#   4. 机器能访问 cnb.cool 与 crates.io
+#
+# ── 产物去向 ────────────────────────────────────────────────────────────────
+#   push / pull_request.merged → 上传为「提交附件」，在提交页与仓库页直接下载
+#   v* Tag                    → 额外创建 Release 并挂 zip 附件
+#
+# 注意：CNB 自托管 Windows 节点的 stage script 默认按 PowerShell 执行，
+#       因此所有命令都写成 PowerShell 语法；且自托管节点不启用 Docker，
+#       上传附件走 CNB OpenAPI（tools/ci/upload-artifact.ps1）而非 attachments 插件。
+
+main:
+  # ── PR 合并进 main 后构建 ────────────────────────────────────────────────
+  pull_request.merged:
+    - name: build-and-upload-asset
+      runner:
+        namespace: group
+        tags:
+          - windows
+      stages:
+        - name: build
+          script: |
+            & "$env:CNB_BUILD_WORKSPACE\tools\ci\build-win.ps1"
+
+        - name: upload commit asset
+          script: |
+            & "$env:CNB_BUILD_WORKSPACE\tools\ci\upload-artifact.ps1" -Mode commit
+
+  # ── 直接推 main 也构建一次 ───────────────────────────────────────────────
+  push:
+    - name: build-and-upload-asset
+      runner:
+        namespace: group
+        tags:
+          - windows
+      stages:
+        - name: build
+          script: |
+            & "$env:CNB_BUILD_WORKSPACE\tools\ci\build-win.ps1"
+
+        - name: upload commit asset
+          script: |
+            & "$env:CNB_BUILD_WORKSPACE\tools\ci\upload-artifact.ps1" -Mode commit
+
+# ── 推 v* Tag：构建 + 建 Release ───────────────────────────────────────────
+$:
+  v*:
+    tag_push:
+      - name: build-and-release
+        runner:
+          namespace: group
+          tags:
+            - windows
+        stages:
+          - name: build
+            script: |
+              & "$env:CNB_BUILD_WORKSPACE\tools\ci\build-win.ps1"
+
+          - name: create release and upload asset
+            script: |
+              & "$env:CNB_BUILD_WORKSPACE\tools\ci\upload-artifact.ps1" -Mode release
