@@ -8,8 +8,8 @@
 # ── 编译输出 / 发布二进制（可由源码复现；WinDivert 运行时在 assets/）──
 /dist/
 
-# ── 验证截图（根目录临时产物；正式截图见 docs/screenshots/）──
-ui-*.png
+# ── 验证截图（仅根目录临时产物；正式截图见 docs/screenshots/，不被忽略）──
+/ui-*.png
 
 # ── 工具 / AI 本地状态 ──
 .workbuddy/
