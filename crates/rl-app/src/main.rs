@@ -459,6 +459,22 @@ fn saved_to_dir(s: &settings::SavedDir) -> DirState {
     DirState { enabled: s.enabled, sel: str_to_sel(&s.sel), custom: s.custom.clone() }
 }
 
+/// 「清除限速」的真正语义：删掉这条程序的规则，**并且**把两个方向的开关复位。
+///
+/// 旧实现只做 `rules.remove(key)`：`set_rule` 里有个「点开关即视为要求限速」的语义，
+/// 只要某一方向 enabled 且速率为 0，`current_config()` 就会把 `master` 之外的
+/// `other_*` 和这条记录一起算进去 —— 而一旦两方向都是「开 + 速率 0」，
+/// 界面上仍然显示「限速中」，用户以为没清掉；更糟的是 `clear_rule` 之后再点
+/// 同一个方向的开关，`enabled` 从未被复位，开关状态和实际行为完全脱节。
+/// 这里统一走一个函数，保证「清除」之后没有任何残留。
+fn clear_program_rule(rules: &mut HashMap<String, RuleState>, key: &str) {
+    if let Some(rule) = rules.get_mut(key) {
+        rule.down.enabled = false;
+        rule.up.enabled = false;
+    }
+    rules.remove(key);
+}
+
 fn rule_to_saved(r: &RuleState) -> settings::SavedRule {
     settings::SavedRule { down: dir_to_saved(&r.down), up: dir_to_saved(&r.up) }
 }
@@ -746,7 +762,7 @@ fn backend(shared: Shared, stop: Arc<AtomicBool>) {
                 "句柄 {}/2 · 桶 {} · 收包 {} · 命中限速 {} · 丢弃 {} · 程序识别 {} · 连接表 TCP {}/UDP {} · v6 {}/{}\n生效桶：{}",
                 d.handles, d.buckets, d.packets, d.limited, d.dropped,
                 d.program_hits, d.tcp_entries, d.udp_entries,
-                        d.tcp6_entries, d.udp6_entries,
+                d.tcp6_entries, d.udp6_entries,
                 if d.bucket_desc.is_empty() { "无" } else { &d.bucket_desc }
             );
             // 开了总开关却没有任何桶 = 根本没接管流量，明确提示，避免「点了没效果」
@@ -826,11 +842,15 @@ fn select_program(state: State<'_, Shared>, key: Option<String>) {
     s.save();
 }
 
+/// 清除某个程序的限速。
+///
+/// 除了删规则，还必须把内存里的规则状态复位、再落盘；否则前端下一次
+/// `get_snapshot` 仍会看到 `sel/自定义值` 残留（表现为「清除限速按了没反应」）。
 #[tauri::command]
 fn clear_rule(state: State<'_, Shared>, key: String) {
     let s = {
         let Some(mut g) = lock_mutex(&state) else { return };
-        g.rules.remove(&key);
+        clear_program_rule(&mut g.rules, &key);
         collect_settings(&g)
     };
     s.save();
@@ -1125,6 +1145,47 @@ mod tests {
         apply_rule_edit(&mut rule, &e);
         assert!(matches!(rule.down.sel, Sel::Profile(7)));
         assert_eq!(rule.down.bytes_per_sec(Unit::Mb), 5 * 1024 * 1024);
+    }
+
+    /// ★ 回归：点「清除限速」之后，该程序不能再有任何限速残留。
+    ///
+    /// 旧实现只 `rules.remove(key)`，两个方向的 `enabled/custom` 状态仍留在
+    /// 内存与 settings.json 里，用户看到的开关、数值都和实际下发不一致，
+    /// 表现为「清除限速点了没反应」。
+    #[test]
+    fn clear_rule_removes_all_traces() {
+        let mut g = inner_with_single_program_limit();
+        let key = "c:\\adu.exe".to_string();
+        assert!(g.is_limited(&key));
+
+        clear_program_rule(&mut g.rules, &key);
+
+        assert!(!g.rules.contains_key(&key), "规则必须被删除");
+        assert!(!g.is_limited(&key), "清除后不能再显示为限速中");
+        assert_eq!(g.current_config().rules.len(), 0, "下发给引擎的配置里不能再有它");
+
+        let saved = collect_settings(&g);
+        assert!(
+            saved.rules.iter().all(|(k, _)| k != &key),
+            "settings.json 里也不能残留这条规则"
+        );
+    }
+
+    /// 清除后再点同一方向的开关，必须重新按默认挡位生效（状态没有被打乱）。
+    #[test]
+    fn after_clear_toggle_works_again() {
+        let mut g = inner_with_single_program_limit();
+        let key = "c:\\adu.exe".to_string();
+        clear_program_rule(&mut g.rules, &key);
+
+        let mut e = edit("down", None);
+        e.enabled = Some(true);
+        let rule = g.rules.entry(key.clone()).or_insert_with(RuleState::new);
+        apply_rule_edit(rule, &e);
+        let after = g.rule_of(&key);
+        assert!(after.down.enabled, "重新打开的开关必须是真的 enabled");
+        assert!(after.down.bytes_per_sec(g.unit) > 0, "应回落到默认挡位速率");
+        assert!(g.is_limited(&key), "重新打开开关后应恢复限速");
     }
 
     /// 输入数值会触发「自动开启总开关」，否则引擎根本不接管流量。
