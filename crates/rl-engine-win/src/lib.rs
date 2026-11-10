@@ -32,16 +32,21 @@ use rl_core::{ByteCounter, Direction, Engine, LimitConfig, TokenBucket};
 
 /// WinDivert 文档定义的最大包长 = 40 + 0xFFFF
 const WINDIVERT_MTU_MAX: usize = 40 + 0xFFFF;
-/// 包在驱动队列里被自动丢弃前的**最短**等待时间（毫秒）。
-/// 注意它不是 recv 超时：设得太小（原来 4ms）会让高带宽下的包在用户态来不及
-/// 处理时就被驱动丢弃，实测速率被额外压低、且抖动明显。
-/// 取 20ms：两个句柄各一次空读最多约 40ms，配置响应仍足够快，
-/// 同时给高带宽流量更充裕的排队窗口。
-const QUEUE_TIME_MS: u64 = 20;
+/// 包在驱动队列里被自动丢弃前的最长排队时间（毫秒）。
+///
+/// WinDivert 允许的范围是 100ms ~ 16000ms（默认 2000ms）。原实现的 20ms 低于
+/// 合法下限，`WinDivertSetParam` 直接失败、实际仍是 2000ms，等于没设置。
+/// 取 100ms：既给了用户态充足的排空时间，又避免令牌不足时包在驱动里积压 2 秒
+/// 带来的巨大延迟与重复重传。
+const QUEUE_TIME_MS: u64 = 100;
 /// WINDIVERT_LAYER_NETWORK
 const LAYER_NETWORK: u32 = 0;
 /// WINDIVERT_PARAM_QUEUE_TIME
 const PARAM_QUEUE_TIME: u32 = 1;
+/// 重叠 I/O：操作已挂起，完成时事件会被置位
+const ERROR_IO_PENDING: i32 = 997;
+const WAIT_OBJECT_0: u32 = 0;
+const WAIT_TIMEOUT: u32 = 258;
 /// 「其他流量」在统计表 / 桶表里的键（真实程序 key 不会是它）
 pub const OTHER: &str = "__other__";
 
@@ -61,12 +66,56 @@ pub type StatsMap = Arc<Mutex<HashMap<StatKey, Arc<ByteCounter>>>>;
 #[derive(Clone, Copy)]
 struct Address([u8; 80]);
 
+/// Win32 `OVERLAPPED`（x64 布局，共 32 字节）。
+///
+/// 用更精确的字段声明而不是定长缓冲：`h_event` 需要读出来做等待。
+/// `Internal` / `InternalHigh` 由内核读写，绝不能移动该结构体的地址，
+/// 所以 `DirHandle` 里用 `Box<Overlapped>` 固定它的位置。
+#[repr(C)]
+struct Overlapped {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+    h_event: Handle,
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn CreateEventW(
+        attributes: *mut std::ffi::c_void,
+        manual_reset: i32,
+        initial_state: i32,
+        name: *const u16,
+    ) -> Handle;
+    fn ResetEvent(handle: Handle) -> i32;
+    fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
+    fn GetOverlappedResult(
+        handle: Handle,
+        overlapped: *mut Overlapped,
+        transferred: *mut u32,
+        wait: i32,
+    ) -> i32;
+    fn CloseHandle(handle: Handle) -> i32;
+}
+
 /// 句柄用整数表示而不是裸指针，这样天然满足 Send
 type Handle = isize;
 const INVALID_HANDLE: Handle = -1;
 
 type FnOpen = unsafe extern "system" fn(*const c_char, u32, i16, u64) -> Handle;
-type FnRecv = unsafe extern "system" fn(Handle, *mut u8, u32, *mut u32, *mut Address) -> i32;
+/// 带 `lpOverlapped` 的收包接口：挂起重叠 I/O，从而可以「等一小会儿就拿走」，
+/// 不会像 `WinDivertRecv` 那样在一个方向没包时永远阻塞。
+type FnRecvEx = unsafe extern "system" fn(
+    Handle,
+    *mut u8,
+    u32,
+    *mut u32,
+    u64,
+    *mut Address,
+    *mut u32,
+    *mut Overlapped,
+) -> i32;
 type FnSend = unsafe extern "system" fn(Handle, *const u8, u32, *mut u32, *const Address) -> i32;
 type FnClose = unsafe extern "system" fn(Handle) -> i32;
 type FnSetParam = unsafe extern "system" fn(Handle, u32, u64) -> i32;
@@ -79,7 +128,7 @@ type FnCompileFilter = unsafe extern "system" fn(
 #[derive(Clone, Copy)]
 struct Api {
     open: FnOpen,
-    recv: FnRecv,
+    recv_ex: FnRecvEx,
     send: FnSend,
     close: FnClose,
     set_param: FnSetParam,
@@ -101,7 +150,7 @@ fn load_api() -> Result<Api, String> {
         })?;
 
         let open: Symbol<FnOpen> = symbol(&dll, b"WinDivertOpen\0")?;
-        let recv: Symbol<FnRecv> = symbol(&dll, b"WinDivertRecv\0")?;
+        let recv_ex: Symbol<FnRecvEx> = symbol(&dll, b"WinDivertRecvEx\0")?;
         let send: Symbol<FnSend> = symbol(&dll, b"WinDivertSend\0")?;
         let close: Symbol<FnClose> = symbol(&dll, b"WinDivertClose\0")?;
         let set_param: Symbol<FnSetParam> = symbol(&dll, b"WinDivertSetParam\0")?;
@@ -109,7 +158,7 @@ fn load_api() -> Result<Api, String> {
 
         let api = Api {
             open: *open,
-            recv: *recv,
+            recv_ex: *recv_ex,
             send: *send,
             close: *close,
             set_param: *set_param,
@@ -167,8 +216,16 @@ fn explain_open_error(code: i32) -> &'static str {
 struct DirHandle {
     dir: Direction,
     handle: Handle,
-    buf: Vec<u8>,
-    addr: Address,
+    buf: Box<[u8]>,
+    /// 地址 / 长度 / OVERLAPPED 都放进 Box：重叠 I/O 挂起期间驱动会异步回写，
+    /// 这些内存必须保持地址稳定（不能是栈变量）
+    addr: Box<Address>,
+    recv_len: Box<u32>,
+    addr_len: Box<u32>,
+    overlapped: Box<Overlapped>,
+    /// 是否已有一个收包请求挂在驱动里等待完成
+    recv_pending: bool,
+    h_event: Handle,
 }
 
 impl DirHandle {
@@ -188,33 +245,94 @@ impl DirHandle {
         }
         unsafe { (api.set_param)(handle, PARAM_QUEUE_TIME, QUEUE_TIME_MS) };
 
+        let h_event = unsafe { CreateEventW(std::ptr::null_mut(), 0, 0, std::ptr::null()) };
+        if h_event == 0 {
+            let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            unsafe { (api.close)(handle) };
+            return Err(format!("创建收包事件失败（Win32 错误 {code}）"));
+        }
+
         Ok(Self {
             dir,
             handle,
-            buf: vec![0u8; WINDIVERT_MTU_MAX],
-            addr: Address([0; 80]),
+            buf: vec![0u8; WINDIVERT_MTU_MAX].into_boxed_slice(),
+            addr: Box::new(Address([0; 80])),
+            recv_len: Box::new(0),
+            addr_len: Box::new(std::mem::size_of::<Address>() as u32),
+            overlapped: Box::new(Overlapped {
+                internal: 0,
+                internal_high: 0,
+                offset: 0,
+                offset_high: 0,
+                h_event,
+            }),
+            recv_pending: false,
+            h_event,
         })
     }
 
-    /// 收一个包，返回包长；0 表示本轮没包（队列超时）
-    fn recv(&mut self) -> Result<usize, String> {
+    /// 收一个包：`Some(包长)` 表示取到了包，`None` 表示本轮该方向没包。
+    ///
+    /// 必须用 `WinDivertRecvEx` + 重叠 I/O。原来的 `WinDivertRecv` 在没有包时
+    /// **会一直阻塞**（不是「队列超时返回」），而引擎又是两个句柄串行轮询：
+    /// 下载时上行只有零星 ACK，收下行后就会卡在上行 recv 上，直到下一个 ACK
+    /// 才继续处理一个下行包 → 整机吞吐被压到「每 RTT 一个包」的量级。
+    /// 这就是「只限一个程序，整台电脑却像被限速」的真正原因。
+    fn recv(&mut self, timeout_ms: u32) -> Result<Option<usize>, String> {
         let api = api()?;
-        let mut len: u32 = 0;
-        let ok = unsafe {
-            (api.recv)(
-                self.handle,
-                self.buf.as_mut_ptr(),
-                self.buf.len() as u32,
-                &mut len,
-                &mut self.addr,
-            )
-        };
-        if ok == 0 {
-            // QUEUE_TIME(4ms) 到期、队列为空时 WinDivertRecv 返回 FALSE，
-            // 这是「本轮没包」而不是错误（与原实现一致）。
-            return Ok(0);
+        if !self.recv_pending {
+            // 上一次若同步完成，事件可能仍处于置位状态；先清掉，避免本轮误判为已完成
+            unsafe { ResetEvent(self.h_event) };
+            *self.recv_len = 0;
+            *self.addr_len = std::mem::size_of::<Address>() as u32;
+            let ok = unsafe {
+                (api.recv_ex)(
+                    self.handle,
+                    self.buf.as_mut_ptr(),
+                    self.buf.len() as u32,
+                    &mut *self.recv_len,
+                    0,
+                    &mut *self.addr,
+                    &mut *self.addr_len,
+                    &mut *self.overlapped,
+                )
+            };
+            if ok != 0 {
+                // 已完成（队列里本来就有包）
+                return Ok(Some(*self.recv_len as usize));
+            }
+            let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if code != ERROR_IO_PENDING {
+                return Err(format!("收包失败（Win32 错误 {code}）"));
+            }
+            self.recv_pending = true;
         }
-        Ok(len as usize)
+
+        match unsafe { WaitForSingleObject(self.h_event, timeout_ms) } {
+            WAIT_TIMEOUT => Ok(None),
+            WAIT_OBJECT_0 => {
+                let mut transferred: u32 = 0;
+                let ok = unsafe {
+                    GetOverlappedResult(
+                        self.handle,
+                        &mut *self.overlapped,
+                        &mut transferred,
+                        0,
+                    )
+                };
+                self.recv_pending = false;
+                if ok == 0 {
+                    let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    return Err(format!("收包完成失败（Win32 错误 {code}）"));
+                }
+                Ok(Some(transferred as usize))
+            }
+            other => {
+                // 操作可能仍挂在驱动里：保留 pending，下一轮继续等，避免对同一个
+                // OVERLAPPED 重复发起收包
+                Err(format!("等待收包事件失败（Win32 返回 {other}）"))
+            }
+        }
     }
 
     /// 原样重注入（校验和由驱动处理）
@@ -227,7 +345,7 @@ impl DirHandle {
                 self.buf.as_ptr(),
                 len as u32,
                 &mut sent,
-                &self.addr,
+                &*self.addr,
             )
         };
         if ok == 0 {
@@ -241,7 +359,11 @@ impl DirHandle {
 impl Drop for DirHandle {
     fn drop(&mut self) {
         if let Ok(api) = api() {
+            // 先关 WinDivert：会取消挂起的重叠收包，之后再释放事件对象
             unsafe { (api.close)(self.handle) };
+        }
+        unsafe {
+            CloseHandle(self.h_event);
         }
     }
 }
@@ -626,10 +748,9 @@ impl Engine for WinDivertEngine {
             let mut idle = true;
             for i in 0..self.handles.len() {
                 let h = &mut self.handles[i];
-                let len = h.recv()?;
-                if len == 0 {
+                let Some(len) = h.recv(0)? else {
                     continue;
-                }
+                };
                 idle = false;
                 handled += 1;
                 self.diag.packets += 1;
