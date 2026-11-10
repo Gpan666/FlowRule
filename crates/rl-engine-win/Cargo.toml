@@ -1,0 +1,13 @@
+[package]
+name = "rl-engine-win"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Windows 限速引擎：动态加载 WinDivert + 令牌桶"
+
+[dependencies]
+rl-core = { path = "../rl-core" }
+
+# 运行时动态加载 WinDivert.dll，不链接 MSVC 的 .lib：
+# 好处是免管理员装 MSVC 生成工具、GNU 工具链也能编译，且缺驱动时优雅降级。
+libloading = "0.8"

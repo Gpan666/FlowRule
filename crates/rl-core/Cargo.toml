@@ -1,0 +1,8 @@
+[package]
+name = "rl-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "限速核心逻辑：单位换算、令牌桶、挡位、速率统计（无平台依赖）"
+
+[dependencies]

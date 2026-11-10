@@ -1,0 +1,27 @@
+# ── 构建产物 ──
+/target/
+**/target/
+
+# ── 旧版 egui 备份（非源码，仅本地回滚用）──
+/legacy/
+
+# ── 编译输出 / 发布二进制（可由源码复现；WinDivert 运行时在 assets/）──
+/dist/
+
+# ── 验证截图（根目录临时产物；正式截图见 docs/screenshots/）──
+ui-*.png
+
+# ── 工具 / AI 本地状态 ──
+.workbuddy/
+.workbuddy-ai/
+
+# ── 编辑器 / 系统 ──
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ── 临时备份 ──
+*.rs.bak
+*.toml.bak

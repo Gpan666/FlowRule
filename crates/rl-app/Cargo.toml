@@ -1,0 +1,32 @@
+[package]
+name = "rl-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "限速器 GUI（Tauri 2 + Miuix 设计语言，Rust 后端 + WebView2 渲染）"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+rl-core = { path = "../rl-core" }
+rl-engine-win = { path = "../rl-engine-win" }
+
+# Tauri 2：Windows 上走 WebView2（系统自带运行时），不捆绑 Chromium。
+# 自定义命令 + 自绘标题栏，不需要任何前端 npm 依赖。
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+sysinfo = "0.39.6"
+# 提取 exe 图标：HICON → RGBA → PNG → base64（都在 lock 里已有，不新增版本）
+png = "0.18"
+base64 = "0.23"
+
+[features]
+# generate_context! 里用 cfg!(not(feature = "custom-protocol")) 判断是否走 devUrl。
+# 本项目不跑 dev server，前端资源必须嵌进 exe，所以默认开启。
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[[bin]]
+name = "rl-app"
+path = "src/main.rs"

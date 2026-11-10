@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>流律</title>
+  <script>try{document.documentElement.dataset.theme=localStorage.getItem('rl-theme')||'light'}catch(e){}</script>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <!-- 弥散背景光斑：Miuix 的壁纸 → 玻璃面板 → 内容卡片 三层结构 -->
+  <div class="ambient" aria-hidden="true">
+    <span class="orb orb-a"></span>
+    <span class="orb orb-b"></span>
+    <span class="orb orb-c"></span>
+  </div>
+
+  <header class="titlebar" data-tauri-drag-region="deep">
+    <div class="tb-left">
+      <div class="tb-logo" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 3v7"/><path d="M12 14v7"/><path d="M5.6 7.6 9.9 12"/><path d="M14.1 12l4.3 4.4"/>
+          <circle cx="12" cy="12" r="2.4" fill="currentColor" stroke="none"/>
+        </svg>
+      </div>
+      <span class="tb-title">流律</span>
+      <span class="tb-sub">网络带宽管理</span>
+    </div>
+    <div class="tb-right">
+      <button class="tb-btn" id="themeBtn" title="切换明暗主题" aria-label="切换明暗主题">
+        <svg class="ico-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 14.2A8.5 8.5 0 1 1 9.8 3.5a6.6 6.6 0 0 0 10.7 10.7Z"/></svg>
+        <svg class="ico-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+      </button>
+      <span class="tb-divider"></span>
+      <button class="tb-btn win" data-win="min" aria-label="最小化"><svg viewBox="0 0 12 12"><path d="M2 6h8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></button>
+      <button class="tb-btn win" data-win="max" aria-label="最大化"><svg viewBox="0 0 12 12"><rect x="2.6" y="2.6" width="6.8" height="6.8" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.2"/></svg></button>
+      <button class="tb-btn win close" data-win="close" aria-label="关闭"><svg viewBox="0 0 12 12"><path d="M3 3l6 6M9 3l-6 6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></button>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <!-- ── 总览 Hero ── -->
+    <section class="card hero">
+      <div class="hero-top">
+        <div>
+          <div class="eyebrow">OVERVIEW · 总览</div>
+          <h1 class="hero-title">流量活动</h1>
+        </div>
+        <div class="hero-controls">
+          <div class="segmented" id="unitSeg" data-active="kb">
+            <span class="seg-thumb"></span>
+            <button class="seg-item active" data-unit="kb">KB/s</button>
+            <button class="seg-item" data-unit="mb">MB/s</button>
+          </div>
+          <div class="master-wrap">
+            <span class="master-label" id="masterLabel">限速已暂停</span>
+            <button class="switch" id="masterSwitch" role="switch" aria-label="限速总开关"><span class="knob"></span></button>
+          </div>
+        </div>
+      </div>
+
+      <div class="stat-row">
+        <div class="stat">
+          <div class="stat-head"><span class="dot down"></span> 下行速率 <span class="stat-en">DOWNLOAD</span></div>
+          <div class="big-number"><span id="downNum">0</span><span class="big-unit" id="downUnit">KB/s</span></div>
+        </div>
+        <div class="stat-divider"></div>
+        <div class="stat">
+          <div class="stat-head"><span class="dot up"></span> 上行速率 <span class="stat-en">UPLOAD</span></div>
+          <div class="big-number"><span id="upNum">0</span><span class="big-unit" id="upUnit">KB/s</span></div>
+        </div>
+        <div class="hero-status">
+          <div class="status-pill" id="statusPill"><span class="pulse"></span><span id="statusText">正在启动引擎…</span></div>
+          <div class="warning-pill" id="warningPill" hidden></div>
+        </div>
+      </div>
+
+      <div class="graph-wrap">
+        <svg id="graph" viewBox="0 0 1000 180" preserveAspectRatio="none" aria-label="最近 60 秒流量曲线">
+          <defs>
+            <linearGradient id="gradDown" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="var(--down)" stop-opacity=".34"/>
+              <stop offset="100%" stop-color="var(--down)" stop-opacity="0"/>
+            </linearGradient>
+            <linearGradient id="gradUp" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="var(--up)" stop-opacity=".26"/>
+              <stop offset="100%" stop-color="var(--up)" stop-opacity="0"/>
+            </linearGradient>
+          </defs>
+          <g class="grid">
+            <!-- Miuix 风格：只留极淡的水平虚线参考 + 一条基线，不要方格 -->
+            <line class="guide" x1="0" y1="45" x2="1000" y2="45"/>
+            <line class="guide" x1="0" y1="90" x2="1000" y2="90"/>
+            <line class="guide" x1="0" y1="135" x2="1000" y2="135"/>
+            <line class="baseline" x1="0" y1="179" x2="1000" y2="179"/>
+          </g>
+          <path id="fillUp" fill="url(#gradUp)" d=""/>
+          <path id="fillDown" fill="url(#gradDown)" d=""/>
+          <path id="pathUp" fill="none" stroke="var(--up)" stroke-width="2" vector-effect="non-scaling-stroke" stroke-linecap="round" d=""/>
+          <path id="pathDown" fill="none" stroke="var(--down)" stroke-width="2.2" vector-effect="non-scaling-stroke" stroke-linecap="round" d=""/>
+        </svg>
+        <div class="graph-empty" id="graphEmpty">开启总开关并设置限速后，这里会显示最近 60 秒的速率曲线</div>
+        <div class="graph-foot"><span class="legend"><i class="dot down"></i>下行</span><span class="legend"><i class="dot up"></i>上行</span><span class="peak" id="peakText">峰值 —</span></div>
+      </div>
+    </section>
+
+    <div class="columns">
+      <!-- ── 程序列表 ── -->
+      <section class="card programs-card">
+        <div class="card-head">
+          <div><div class="eyebrow">APPLICATIONS</div><h2>运行中的程序</h2></div>
+          <span class="count-chip" id="countChip">扫描中…</span>
+        </div>
+        <div class="search-row">
+          <div class="search-box">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="10.8" cy="10.8" r="6.2"/><path d="M15.4 15.4 20 20"/></svg>
+            <input id="search" type="text" placeholder="搜索程序 / 路径 / PID" autocomplete="off" spellcheck="false" />
+          </div>
+          <button class="icon-btn" id="refreshBtn" title="立即刷新进程" aria-label="立即刷新进程">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-2.3 6"/><path d="M20 5v6h-6"/></svg>
+          </button>
+        </div>
+        <div class="list-head"><span>程序</span><span>↓ 下行</span><span>↑ 上行</span><span></span></div>
+        <div class="program-list" id="programList"></div>
+      </section>
+
+      <div class="right-col">
+        <!-- ── 选中程序规则 ── -->
+        <section class="card detail-card">
+          <div class="detail-empty" id="detailEmpty">
+            <div class="empty-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5.5h16v11H4z"/><path d="M4 9.5h16"/><path d="M8 13.5h8"/></svg>
+            </div>
+            <p>从左侧选择一个程序</p>
+            <span>为它单独设置上行 / 下行带宽</span>
+          </div>
+
+          <div class="detail-body" id="detailBody" hidden>
+            <div class="card-head detail-head">
+              <div class="app-meta">
+                <div class="app-icon" id="detailIcon" hidden></div>
+                <div class="app-text"><h2 id="detailName">—</h2><div class="path" id="detailPath">—</div></div>
+              </div>
+              <button class="text-btn danger" id="clearBtn">清除限速</button>
+            </div>
+            <div class="live-row">
+              <span class="live-chip"><i class="dot down"></i><b id="detailDown">0 KB/s</b><small>下行实时</small></span>
+              <span class="live-chip"><i class="dot up"></i><b id="detailUp">0 KB/s</b><small>上行实时</small></span>
+              <span class="proc-chip" id="detailPids">—</span>
+            </div>
+
+            <div class="dir-block" data-target="program" data-dir="down">
+              <div class="dir-head">
+                <div class="dir-title"><span class="dir-icon down">↓</span>下行限速</div>
+                <div class="dir-right"><span class="dir-value" data-role="value">不限速</span><button class="switch small" data-role="switch" role="switch"><span class="knob"></span></button></div>
+              </div>
+              <div class="dir-explain" data-role="explain">不限速：该方向不接管流量</div>
+              <div class="chips" data-role="chips"></div>
+              <div class="custom-row" data-role="customRow" hidden><input type="text" inputmode="decimal" data-role="customInput" placeholder="输入数值" autocomplete="off" spellcheck="false" /><span data-role="unitLabel">KB/s</span></div>
+            </div>
+
+            <div class="dir-block" data-target="program" data-dir="up">
+              <div class="dir-head">
+                <div class="dir-title"><span class="dir-icon up">↑</span>上行限速</div>
+                <div class="dir-right"><span class="dir-value" data-role="value">不限速</span><button class="switch small" data-role="switch" role="switch"><span class="knob"></span></button></div>
+              </div>
+              <div class="dir-explain" data-role="explain">不限速：该方向不接管流量</div>
+              <div class="chips" data-role="chips"></div>
+              <div class="custom-row" data-role="customRow" hidden><input type="text" inputmode="decimal" data-role="customInput" placeholder="输入数值" autocomplete="off" spellcheck="false" /><span data-role="unitLabel">KB/s</span></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ── 其他流量兜底 ── -->
+        <section class="card other-card">
+          <div class="card-head">
+            <div><div class="eyebrow">FALLBACK</div><h2>其他流量</h2></div>
+            <span class="hint">没有被单独限速的程序</span>
+          </div>
+          <div class="dir-block compact" data-target="other" data-dir="down">
+            <div class="dir-head">
+              <div class="dir-title"><span class="dir-icon down">↓</span>下行限速</div>
+              <div class="dir-right"><span class="dir-value" data-role="value">不限速</span><button class="switch small" data-role="switch" role="switch"><span class="knob"></span></button></div>
+            </div>
+            <div class="chips" data-role="chips"></div>
+            <div class="custom-row" data-role="customRow" hidden><input type="text" inputmode="decimal" data-role="customInput" placeholder="输入数值" autocomplete="off" spellcheck="false" /><span data-role="unitLabel">KB/s</span></div>
+          </div>
+          <div class="dir-block compact" data-target="other" data-dir="up">
+            <div class="dir-head">
+              <div class="dir-title"><span class="dir-icon up">↑</span>上行限速</div>
+              <div class="dir-right"><span class="dir-value" data-role="value">不限速</span><button class="switch small" data-role="switch" role="switch"><span class="knob"></span></button></div>
+            </div>
+            <div class="chips" data-role="chips"></div>
+            <div class="custom-row" data-role="customRow" hidden><input type="text" inputmode="decimal" data-role="customInput" placeholder="输入数值" autocomplete="off" spellcheck="false" /><span data-role="unitLabel">KB/s</span></div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </main>
+
+  <script src="./app.js"></script>
+</body>
+</html>
