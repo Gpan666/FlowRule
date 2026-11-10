@@ -561,3 +561,61 @@ OK   processId == 4242                layer=2 (FLOW) 才通过
 - 提权后下行/上行速率是否稳定在设定值 ±10%（计划用下载大文件 / iperf3 观察曲线）
 - 进程归属映射对短连接、UDP、TIME_WAIT 的覆盖准确度
 - 安全软件是否会拦截 WinDivert64.sys（错误 1275 已给出白名单提示）
+
+## 13. 「能切换但没效果」（2026-11-10 20:05）
+
+用户反馈限速开关能点了，但**实际不降速**。排查后是几个叠加的产品/覆盖缺口，
+而非引擎逻辑错误（连接表布局、PID、端口字节序都用真实 `GetExtendedTcpTable` 验证过：
+273 条 TCP / 85 条 UDP，PID 全非零、地址端口换算正确）。
+
+### 13.1 根因 A：`master=false` 让 `current_config()` 直接返回 unlimited
+`DirState::new()` 是 `{ enabled:false, sel:Profile(5) }`，界面上 1024 挡位**高亮但
+`enabled=false`** → `bytes_per_sec()` 返回 0 → `short()` 显示「不限速」。
+用户点挡位后若没点顶部总开关，`master` 仍是 false，`current_config()` 直接
+`return LimitConfig::unlimited()` → 引擎 `desired` 为空 → `buckets.is_empty()` →
+**句柄全部关闭，一个包都不接管**。用户看到「开关亮了却完全没效果」。
+
+修复（双保险）：
+- `set_rule` 里凡是启用型操作（`enabled=true` / `profile_id` / `custom` / `custom_value`）
+  自动 `g.master = true`；用户仍可用总开关手动暂停。
+- `set_master(on=true)` 时若当前没有任何生效规则，自动启用「其他流量」下行
+  当前选中挡位（默认 1 MB/s），让「开启」立刻有可见效果。
+  验证：`tools/diag_config.mjs` 三种场景（只点总开关 / 只点挡位 / 开上行）
+  全部产生非零速率，PASS。
+
+### 13.2 根因 B：只接管 IPv4，IPv6 / QUIC 流量完全漏掉
+`base_filter` 原来是 `ip and (tcp or udp)`，WinDivert 的 `ip` 字段**只匹配 IPv4**。
+现代浏览器大量走 IPv6 / HTTP3(QUIC)，这些包根本不进句柄。
+改为 `inbound|outbound and (ip or ipv6) and (tcp or udp) and not loopback and not impostor`
+（已用真实 DLL 离线编译校验通过）。IPv6 包的五元组暂不解析，归入「其他流量」桶，
+因此「其他流量」限速对 IPv6 生效；程序级归属目前仅 IPv4，已在 README 标注。
+
+### 13.3 新增实时诊断（定位「点了没效果」的关键手段）
+- `rl-engine-win::EngineDiag`：句柄数 / 桶数 / 收包 / 命中限速 / 丢弃 /
+  程序识别 / 连接表 TCP+UDP 条目数 / PID 规则数。`poll()` 里累计。
+- `Snapshot.engine_diag` → 前端总览右下方常驻一行小字（`.engine-diag`）。
+  「句柄 0/2」= 没接管流量；「丢弃」在涨 = 限速确实在生效；
+  「程序识别 0」= 五元组归属全落空（但仍应走「其他流量」桶）。
+- 后台每 500ms 节流写入，避免高流量下每轮抢锁；`apply` 失败分支也刷新诊断，
+  否则非管理员时诊断恒为 0 会误导。
+- `handles==0 && buckets==0` 时 warning 明确提示「未接管流量：请选择挡位…」。
+
+### 13.4 WinDivert 语义澄清（查文档确认，避免再踩）
+- `WINDIVERT_PARAM_QUEUE_TIME` 不是 recv 超时，而是「包在驱动队列里被自动丢弃前的
+  最短等待时间」；`WinDivertRecv` 无包时等待，队列到期返回 FALSE 属正常「本轮没包」。
+- `impostor` 是 NETWORK 层合法字段，指「由其他驱动注入的包」；`WinDivertSend`
+  不会自动把 Impostor 置 1。两个全局句柄都是 priority 0 但 filter 用
+  inbound/outbound **互斥**，符合文档「同优先级须互斥」的要求；`not impostor`
+  用于排除第三方驱动注入包造成的循环，保留。
+- 修掉自己引入的一处回归：`recv()` 曾把 `ok==0`（正常无包）当错误上报，
+  已恢复为 `Ok(0)`。
+
+### 13.5 验证
+- 35 单测全绿；`check_filter.py` 全 PASS；`verify_no_freeze.mjs` 9 命令全 PASS。
+- `tools/diag_config.mjs`：只点总开关 → `other_down_bytes=1048576`、
+  只点挡位 → `master=true` 且 `262144`、开上行 → `1048576`；诊断桶数随规则
+  从 0→1→2 正确变化，PASS。
+- `tools/diag_engine.mjs`（非管理员）：错误仍是精确的 Win32 错误 5，文案无误报。
+
+> 本机非管理员，**驱动加载后的真实降速仍未实测**。诊断行是让用户自行确认的
+> 关键：管理员运行后应看到「句柄 2/2」「收包数在涨」「丢弃数在涨」。

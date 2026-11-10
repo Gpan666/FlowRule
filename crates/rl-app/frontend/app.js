@@ -219,6 +219,9 @@ function render(s) {
     // 长诊断（含 Win32 错误码）换行完整显示，短提示保持胶囊单行
     warn.classList.toggle('long', s.warning.length > 18);
   }
+  const diag = $('#engineDiag');
+  diag.hidden = !s.engine_diag;
+  if (s.engine_diag) diag.textContent = s.engine_diag;
 
   $$('[data-role="profileChip"]').forEach((b, i) => {
     const p = s.profiles[i % s.profiles.length];

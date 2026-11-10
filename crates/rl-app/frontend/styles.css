@@ -458,3 +458,13 @@ h1, h2 { margin: 0; }
   pointer-events: none;
 }
 .err-toast[hidden] { display: none; }
+
+/* ── 引擎实时诊断（定位「点了限速没效果」）── */
+.engine-diag {
+  max-width: 460px; padding: 6px 10px; border-radius: 12px;
+  font-size: 10.5px; line-height: 1.5; font-weight: 500;
+  color: var(--text-3); background: var(--inner);
+  border: 1px solid var(--line); white-space: normal;
+  text-align: left; font-variant-numeric: tabular-nums;
+}
+.engine-diag[hidden] { display: none; }

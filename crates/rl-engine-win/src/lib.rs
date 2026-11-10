@@ -312,9 +312,32 @@ fn pick_bucket(
     None
 }
 
+/// 引擎实时诊断计数（用于定位「点了没效果」到底断在哪一环）
+#[derive(Debug, Default, Clone)]
+pub struct EngineDiag {
+    /// 已打开的全局句柄数（0 = 完全没接管流量）
+    pub handles: usize,
+    /// 当前生效的令牌桶数
+    pub buckets: usize,
+    /// 累计收到的包数
+    pub packets: u64,
+    /// 命中限速桶的包数
+    pub limited: u64,
+    /// 因令牌不足被丢弃的包数
+    pub dropped: u64,
+    /// 成功识别到具体程序的包数
+    pub program_hits: u64,
+    /// 连接表条目数（TCP / UDP）
+    pub tcp_entries: usize,
+    pub udp_entries: usize,
+    /// 当前 PID→程序 映射条目数
+    pub pid_rules: usize,
+}
+
 pub struct WinDivertEngine {
     /// 两个全局句柄；为空表示当前没有任何限速规则（不接管流量）
     handles: Vec<DirHandle>,
+    diag: EngineDiag,
     /// (程序key|OTHER, 方向) -> 令牌桶
     buckets: HashMap<StatKey, TokenBucket>,
     /// (PID, 方向) -> 程序 key。只登记该方向确实设了限速的程序，
@@ -352,6 +375,7 @@ impl WinDivertEngine {
     pub fn new() -> Self {
         Self {
             handles: Vec::new(),
+            diag: EngineDiag::default(),
             buckets: HashMap::new(),
             pid_key: HashMap::new(),
             counters: HashMap::new(),
@@ -375,6 +399,17 @@ impl WinDivertEngine {
     /// 当前非致命提示（连接表读取失败 / 规则被跳过等）
     pub fn warning(&self) -> Option<&str> {
         self.warning.as_deref()
+    }
+
+    /// 实时诊断快照（句柄数 / 收包 / 命中 / 丢弃 / 连接表规模）
+    pub fn diag(&self) -> EngineDiag {
+        let mut d = self.diag.clone();
+        d.handles = self.handles.len();
+        d.buckets = self.buckets.len();
+        d.pid_rules = self.pid_key.len();
+        d.tcp_entries = self.proc_map.tcp_len();
+        d.udp_entries = self.proc_map.udp_len();
+        d
     }
 
     /// 依据配置重建 pid→key、令牌桶，并按需开关全局句柄。
@@ -471,14 +506,24 @@ impl Engine for WinDivertEngine {
                 }
                 idle = false;
                 handled += 1;
+                self.diag.packets += 1;
                 let dir = h.dir;
 
                 let key = classify(&self.proc_map, &self.pid_key, &h.buf[..len], dir);
+                if key != OTHER {
+                    self.diag.program_hits += 1;
+                }
                 let bucket_key = pick_bucket(&self.buckets, &key, dir);
+                if bucket_key.is_some() {
+                    self.diag.limited += 1;
+                }
                 let pass = match &bucket_key {
                     Some(bk) => self.buckets.get_mut(bk).map(|b| b.try_consume(len as u64)).unwrap_or(true),
                     None => true,
                 };
+                if !pass {
+                    self.diag.dropped += 1;
+                }
 
                 if pass {
                     h.reinject(len)?;

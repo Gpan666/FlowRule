@@ -40,8 +40,8 @@ impl Direction {
     /// `not impostor` 用于排除 WinDivertSend 重注入的包，避免自己捕获自己形成死循环。
     pub fn base_filter(self) -> &'static str {
         match self {
-            Direction::Down => "inbound and ip and (tcp or udp) and not loopback and not impostor",
-            Direction::Up => "outbound and ip and (tcp or udp) and not loopback and not impostor",
+            Direction::Down => "inbound and (ip or ipv6) and (tcp or udp) and not loopback and not impostor",
+            Direction::Up => "outbound and (ip or ipv6) and (tcp or udp) and not loopback and not impostor",
         }
     }
 }

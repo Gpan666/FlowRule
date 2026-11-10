@@ -151,6 +151,8 @@ struct Inner {
 
     status: String,
     warning: Option<String>,
+    /// 引擎实时诊断，供界面显示「点了有没有真的接管流量」
+    engine_diag: String,
 }
 
 type Shared = Arc<Mutex<Inner>>;
@@ -191,6 +193,7 @@ impl Inner {
             last_sample: Instant::now(),
             status: "正在启动引擎…".to_string(),
             warning: None,
+            engine_diag: String::new(),
         }
     }
 
@@ -378,6 +381,7 @@ impl Inner {
             master: self.master,
             status: self.status.clone(),
             warning: self.warning.clone(),
+            engine_diag: self.engine_diag.clone(),
             scanning: self.scanning,
             program_count: programs.len(),
             process_count: programs.iter().map(|p| p.pids).sum(),
@@ -501,6 +505,7 @@ struct Snapshot {
     master: bool,
     status: String,
     warning: Option<String>,
+    engine_diag: String,
     scanning: bool,
     program_count: usize,
     process_count: usize,
@@ -611,6 +616,9 @@ fn backend(shared: Shared, stop: Arc<AtomicBool>) {
     let mut last_attempted: Option<LimitConfig> = None;
     let mut last_error: Option<String> = None;
     let mut last_warning: Option<String> = None;
+    let mut last_diag_at = Instant::now()
+        .checked_sub(Duration::from_millis(500))
+        .unwrap_or_else(Instant::now);
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -661,6 +669,14 @@ fn backend(shared: Shared, stop: Arc<AtomicBool>) {
                         Some(e.clone())
                     };
                     last_warning = g.warning.clone();
+                    // 失败也要刷新诊断（否则诊断恒为 0，会误导排查）
+                    let d = engine.diag();
+                    g.engine_diag = format!(
+                        "句柄 {}/2 · 桶 {} · 收包 {} · 命中限速 {} · 丢弃 {} · 程序识别 {} · 连接表 TCP {}/UDP {}",
+                        d.handles, d.buckets, d.packets, d.limited, d.dropped,
+                        d.program_hits, d.tcp_entries, d.udp_entries
+                    );
+                    last_diag_at = Instant::now();
                     // 失败后不要高频重试打开驱动句柄
                     drop(g);
                     thread::sleep(Duration::from_millis(500));
@@ -718,13 +734,29 @@ fn backend(shared: Shared, stop: Arc<AtomicBool>) {
             }
         }
 
-        // 5) 同步引擎的非致命警告（进程识别失败等），仅在变化时写共享状态
+        // 5) 同步引擎的非致命警告与实时诊断。
+        // 诊断里的收包计数在高流量下每轮都变，若每轮都抢锁会加剧锁竞争 → 最多 500ms 刷一次。
         let w = engine.warning().map(|s| s.to_string());
-        if w != last_warning {
+        let now = Instant::now();
+        if w != last_warning || now.duration_since(last_diag_at) >= Duration::from_millis(500) {
+            let d = engine.diag();
+            let diag_text = format!(
+                "句柄 {}/2 · 桶 {} · 收包 {} · 命中限速 {} · 丢弃 {} · 程序识别 {} · 连接表 TCP {}/UDP {}",
+                d.handles, d.buckets, d.packets, d.limited, d.dropped,
+                d.program_hits, d.tcp_entries, d.udp_entries
+            );
+            // 开了总开关却没有任何桶 = 根本没接管流量，明确提示，避免「点了没效果」
+            let hint = if d.handles == 0 && d.buckets == 0 {
+                Some("未接管流量：请选择挡位或开启一个方向的限速开关".to_string())
+            } else {
+                None
+            };
             if let Some(mut g) = lock_mutex(&shared) {
-                g.warning = w.clone();
+                g.warning = w.clone().or(hint);
+                g.engine_diag = diag_text.clone();
             }
             last_warning = w;
+            last_diag_at = now;
         }
     }
 }
@@ -763,6 +795,17 @@ fn set_master(state: State<'_, Shared>, on: bool) {
     let s = {
         let Some(mut g) = lock_mutex(&state) else { return };
         g.master = on;
+        if on {
+            // 「开启总开关」却一条生效规则都没有 → LimitConfig 全 0，引擎不会打开任何
+            // 句柄，用户会看到「开关亮了但完全没限速」。默认挡位在界面上高亮、
+            // 但 DirState.enabled 初始为 false，正是这个陷阱的来源。
+            // 此时自动启用「其他流量」下行的当前选中挡位，让开启立即有可见效果。
+            let any = g.other.down.enabled || g.other.up.enabled
+                || g.rules.values().any(|r| r.down.enabled || r.up.enabled);
+            if !any {
+                g.other.down.enabled = true;
+            }
+        }
         collect_settings(&g)
     };
     s.save();
@@ -820,8 +863,19 @@ fn set_rule(state: State<'_, Shared>, edit: RuleEdit) {
             ds.sel = Sel::Custom;
             ds.enabled = true;
         }
-        if let Some(v) = edit.custom_value {
-            ds.custom = v;
+        if let Some(ref v) = edit.custom_value {
+            ds.custom = v.clone();
+        }
+        // 用户主动设挡位/开关/自定义速率，意图就是「开始限速」。
+        // 若总开关还关着，current_config() 会返回 unlimited()、引擎根本不打开句柄，
+        // 表现为「点了挡位高亮了却完全没效果」。这里自动开启总开关，
+        // 用户仍可随时手动关掉总开关来全局暂停。
+        let activating = edit.enabled == Some(true)
+            || edit.profile_id.is_some()
+            || edit.custom == Some(true)
+            || edit.custom_value.is_some();
+        if activating {
+            g.master = true;
         }
         collect_settings(&g)
     };
@@ -830,7 +884,7 @@ fn set_rule(state: State<'_, Shared>, edit: RuleEdit) {
 
 #[tauri::command]
 fn refresh(state: State<'_, Shared>) {
-    let mut g = state.lock().unwrap();
+    let Some(mut g) = lock_mutex(&state) else { return };
     g.refresh_requested = true;
     g.scanning = true;
 }

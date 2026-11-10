@@ -221,6 +221,9 @@ impl ProcMap {
         self.last_error.as_deref()
     }
 
+    pub fn tcp_len(&self) -> usize { self.tcp.len() }
+    pub fn udp_len(&self) -> usize { self.udp.len() }
+
     /// 查一个包属于哪个进程。
     ///
     /// - `src/dst`：IP 包里的地址（按 `u32::from_le_bytes` 读出，与 MIB DWORD 一致）
