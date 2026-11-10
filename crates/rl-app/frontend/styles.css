@@ -437,3 +437,17 @@ h1, h2 { margin: 0; }
 }
 .elevate-banner .eb-btn:hover { transform: translateY(-1px); box-shadow: 0 9px 20px rgba(255, 122, 24, .42); }
 .elevate-banner .eb-btn:active { transform: translateY(0) scale(.98); }
+
+/* ── 命令错误提示（原先错误被静默吞掉，导致「点了没反应」）── */
+.err-toast {
+  position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%);
+  z-index: 9999; max-width: min(560px, 86vw);
+  padding: 11px 18px; border-radius: 14px;
+  font-size: 12.5px; font-weight: 600; line-height: 1.5;
+  color: #fff; background: rgba(214, 58, 46, .94);
+  border: 1px solid rgba(255, 140, 120, .5);
+  box-shadow: 0 12px 34px rgba(0, 0, 0, .3);
+  animation: rise .25s ease both;
+  pointer-events: none;
+}
+.err-toast[hidden] { display: none; }

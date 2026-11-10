@@ -10,10 +10,32 @@ const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
 }[c]));
 
+let lastErr = { msg: '', at: 0 };
+function showError(msg) {
+  // 同样的错误 5 秒内只提示一次，避免 get_snapshot 轮询把界面刷满
+  const now = Date.now();
+  if (msg === lastErr.msg && now - lastErr.at < 5000) return;
+  lastErr = { msg, at: now };
+  let el = $('#errToast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'errToast';
+    el.className = 'err-toast';
+    document.body.appendChild(el);
+  }
+  el.textContent = msg;
+  el.hidden = false;
+  clearTimeout(showError.timer);
+  showError.timer = setTimeout(() => { el.hidden = true; }, 4000);
+}
+
 function call(cmd, args = {}) {
   const inv = window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke;
   if (!inv) return Promise.resolve(undefined);
-  return inv(cmd, args).catch((e) => { console.error(`[${cmd}]`, e); });
+  return inv(cmd, args).catch((e) => {
+    console.error(`[${cmd}]`, e);
+    showError(`命令 ${cmd} 失败：${e}`);
+  });
 }
 
 let S = null;
@@ -258,10 +280,12 @@ function bindEvents() {
     const val = e.target.value;
     clearTimeout(customTimer);
     customTimer = setTimeout(() => act('set_rule', {
-      target: block.dataset.target,
-      key,
-      direction: block.dataset.dir,
-      custom_value: val
+      edit: {
+        target: block.dataset.target,
+        key,
+        direction: block.dataset.dir,
+        custom_value: val
+      }
     }), 280);
   });
 
@@ -271,10 +295,10 @@ function bindEvents() {
       const block = chip.closest('.dir-block');
       const key = block.dataset.target === 'program' ? (S && S.selected) : null;
       if (block.dataset.target === 'program' && !key) return;
-      const args = { target: block.dataset.target, key, direction: block.dataset.dir };
-      if (chip.dataset.role === 'customChip') args.custom = true;
-      else args.profile_id = Number(chip.dataset.profileId);
-      act('set_rule', args);
+      const edit = { target: block.dataset.target, key, direction: block.dataset.dir };
+      if (chip.dataset.role === 'customChip') edit.custom = true;
+      else edit.profile_id = Number(chip.dataset.profileId);
+      act('set_rule', { edit });
       return;
     }
 
@@ -284,10 +308,12 @@ function bindEvents() {
       const key = block.dataset.target === 'program' ? (S && S.selected) : null;
       if (block.dataset.target === 'program' && !key) return;
       act('set_rule', {
-        target: block.dataset.target,
-        key,
-        direction: block.dataset.dir,
-        enabled: !sw.classList.contains('on')
+        edit: {
+          target: block.dataset.target,
+          key,
+          direction: block.dataset.dir,
+          enabled: !sw.classList.contains('on')
+        }
       });
       return;
     }

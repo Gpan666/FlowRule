@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, State};
@@ -125,6 +125,9 @@ impl RuleState {
 // ────────────────────────────── 共享状态 ──────────────────────────────
 
 struct Inner {
+    /// 提权状态在进程生命周期内不变，启动时探测一次即可，
+    /// 避免每帧快照都调 Win32（也避免持锁做系统调用）
+    elevated: bool,
     unit: Unit,
     master: bool,
     other: RuleState,
@@ -152,9 +155,24 @@ struct Inner {
 
 type Shared = Arc<Mutex<Inner>>;
 
+/// 带超时的加锁：最多等 200ms。std::sync::Mutex 没有超时 API，
+/// 用 try_lock 轮询实现。命令和后台线程统一走这里，任何一方都不允许
+/// 无限期持锁或无限期等待，避免整窗冻结。拿不到锁就跳过本轮（下一轮重试）。
+fn lock_mutex(m: &Mutex<Inner>) -> Option<MutexGuard<'_, Inner>> {
+    for _ in 0..20 {
+        match m.try_lock() {
+            Ok(g) => return Some(g),
+            Err(std::sync::TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(10)),
+            Err(std::sync::TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+        }
+    }
+    None
+}
+
 impl Inner {
     fn new() -> Self {
         Self {
+            elevated: is_elevated(),
             unit: Unit::Kb,
             master: false,
             other: RuleState::new(),
@@ -269,22 +287,6 @@ impl Inner {
         self.rules.get(key).cloned().unwrap_or_else(RuleState::new)
     }
 
-    /// 分批提取真实 exe 图标，避免首次快照卡住（每轮最多 budget 个）。
-    /// 取不到图标的程序缓存 None，前端就不渲染图标位、只显示名称。
-    fn fill_icons(&mut self, budget: usize) {
-        let todo: Vec<(String, Option<String>)> = self
-            .programs
-            .iter()
-            .filter(|p| !self.icon_cache.contains_key(&p.key))
-            .take(budget)
-            .map(|p| (p.key.clone(), p.path.clone()))
-            .collect();
-        for (key, path) in todo {
-            let icon = path.as_deref().and_then(icons::exe_icon_base64);
-            self.icon_cache.insert(key, icon);
-        }
-    }
-
     // ── 快照：前端唯一数据源 ──
 
     fn snapshot(&self) -> Snapshot {
@@ -370,7 +372,7 @@ impl Inner {
         let peak = self.hist_down.max().max(self.hist_up.max());
 
         Snapshot {
-            elevated: is_elevated(),
+            elevated: self.elevated,
             unit: if unit == Unit::Kb { "kb" } else { "mb" }.to_string(),
             unit_label: unit.label().to_string(),
             master: self.master,
@@ -482,11 +484,12 @@ fn collect_settings(g: &Inner) -> settings::Settings {
     }
 }
 
-/// 任一设置变更后落盘，保证重启不丢
-fn persist(state: &State<'_, Shared>) {
-    let s = { let g = state.lock().unwrap(); collect_settings(&g) };
-    s.save();
-}
+// ⚠️ `std::sync::Mutex` 不可重入：任何持有 `Shared` 锁的作用域里都绝不能再次 `lock()`。
+// 曾经 `set_unit` 持着命名 guard 调 `persist()`（内部又 lock 一次），造成自死锁：
+// 该命令线程永久阻塞且锁永不释放，随后后台线程与每 220ms 的 `get_snapshot` 全部排队阻塞，
+// 表现为「点一下限速控件，整个软件卡死」。
+// 统一约定：设置变更一律「锁内改状态 + 锁内 collect_settings 取快照 → 出锁后 s.save()」。
+// save() 是磁盘 IO，也绝不放在持锁作用域里。
 
 // ────────────────────────────── 前端数据契约 ──────────────────────────────
 
@@ -597,9 +600,10 @@ struct RuleEdit {
 fn backend(shared: Shared, stop: Arc<AtomicBool>) {
     let mut engine = WinDivertEngine::new();
     {
-        let mut g = shared.lock().unwrap();
-        g.stats = Some(engine.stats());
-        g.status = "引擎已就绪".to_string();
+        if let Some(mut g) = lock_mutex(&shared) {
+            g.stats = Some(engine.stats());
+            g.status = "引擎已就绪".to_string();
+        }
     }
 
     let mut sys = sysinfo::System::new();
@@ -614,7 +618,10 @@ fn backend(shared: Shared, stop: Arc<AtomicBool>) {
 
         // 1) 配置变更 → apply
         let (cfg, master) = {
-            let g = shared.lock().unwrap();
+            let Some(g) = lock_mutex(&shared) else {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            };
             (g.current_config(), g.master)
         };
         if last_attempted.as_ref() != Some(&cfg) {
@@ -622,7 +629,7 @@ fn backend(shared: Shared, stop: Arc<AtomicBool>) {
             match engine.apply(cfg.clone()) {
                 Ok(()) => {
                     last_error = None;
-                    let mut g = shared.lock().unwrap();
+                    let Some(mut g) = lock_mutex(&shared) else { continue };
                     g.status = if !master {
                         "已暂停 · 所有流量恢复正常".to_string()
                     } else if cfg.is_all_unlimited() {
@@ -639,7 +646,7 @@ fn backend(shared: Shared, stop: Arc<AtomicBool>) {
                 }
                 Err(e) => {
                     last_error = Some(e.clone());
-                    let mut g = shared.lock().unwrap();
+                    let Some(mut g) = lock_mutex(&shared) else { continue };
                     g.status = format!("引擎错误：{e}");
                     if e.contains("权限") || e.contains("管理员") || e.contains("驱动") {
                         g.warning = Some("请以管理员身份运行本程序".to_string());
@@ -650,7 +657,10 @@ fn backend(shared: Shared, stop: Arc<AtomicBool>) {
 
         // 2) 进程扫描（3 秒一次，或前端手动点刷新）
         let need_scan = {
-            let g = shared.lock().unwrap();
+            let Some(g) = lock_mutex(&shared) else {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            };
             g.refresh_requested
         };
         if need_scan || last_scan.elapsed() >= SCAN_INTERVAL {
@@ -666,7 +676,7 @@ fn backend(shared: Shared, stop: Arc<AtomicBool>) {
                     )
                 })
                 .collect();
-            let mut g = shared.lock().unwrap();
+            let Some(mut g) = lock_mutex(&shared) else { continue };
             g.processes(list);
             g.scanning = false;
             g.refresh_requested = false;
@@ -674,17 +684,21 @@ fn backend(shared: Shared, stop: Arc<AtomicBool>) {
         }
 
         // 3) 100ms 采样 + 曲线
-        shared.lock().unwrap().sample();
+        if let Some(mut g) = lock_mutex(&shared) {
+            g.sample();
+        }
 
         // 4) 收包 / 令牌桶判定
         match engine.poll(POLL_BATCH) {
-            Ok(0) => thread::sleep(Duration::from_millis(1)),
-            Ok(_) => {}
+            // 无论本轮有没有包都让出 1ms：管理员下持续有流量时若全速空转，
+            // 后台线程会高频抢 shared 锁，前端 get_snapshot 容易饥饿、界面像假死。
+            Ok(_) => thread::sleep(Duration::from_millis(1)),
             Err(e) => {
                 if last_error.as_deref() != Some(e.as_str()) {
                     last_error = Some(e.clone());
-                    let mut g = shared.lock().unwrap();
-                    g.status = format!("引擎错误：{e}");
+                    if let Some(mut g) = lock_mutex(&shared) {
+                        g.status = format!("引擎错误：{e}");
+                    }
                 }
                 thread::sleep(Duration::from_millis(250));
             }
@@ -695,41 +709,76 @@ fn backend(shared: Shared, stop: Arc<AtomicBool>) {
 // ────────────────────────────── Tauri 命令 ──────────────────────────────
 
 #[tauri::command]
-fn get_snapshot(state: State<'_, Shared>) -> Snapshot {
-    let mut g = state.lock().unwrap();
-    g.fill_icons(24);
-    g.snapshot()
+fn get_snapshot(state: State<'_, Shared>) -> Option<Snapshot> {
+    // 图标提取走 Win32 Shell API（每个程序一次 SHGetFileInfoW/GetDIBits），可能较慢。
+    // 绝不能持锁做：先在锁内取出待办清单，出锁后提取，再回锁内写缓存。
+    let todo: Vec<(String, Option<String>)> = {
+        let g = lock_mutex(&state)?;
+        g.programs
+            .iter()
+            .filter(|p| !g.icon_cache.contains_key(&p.key))
+            .take(24)
+            .map(|p| (p.key.clone(), p.path.clone()))
+            .collect()
+    };
+    if !todo.is_empty() {
+        let mut fetched = Vec::with_capacity(todo.len());
+        for (key, path) in todo {
+            let icon = path.as_deref().and_then(icons::exe_icon_base64);
+            fetched.push((key, icon));
+        }
+        let mut g = lock_mutex(&state)?;
+        for (k, v) in fetched {
+            g.icon_cache.entry(k).or_insert(v);
+        }
+    }
+    Some(lock_mutex(&state)?.snapshot())
 }
 
 #[tauri::command]
 fn set_master(state: State<'_, Shared>, on: bool) {
-    state.lock().unwrap().master = on;
-    persist(&state);
+    let s = {
+        let Some(mut g) = lock_mutex(&state) else { return };
+        g.master = on;
+        collect_settings(&g)
+    };
+    s.save();
 }
 
 #[tauri::command]
 fn set_unit(state: State<'_, Shared>, unit: String) {
-    let mut g = state.lock().unwrap();
-    g.unit = if unit == "mb" { Unit::Mb } else { Unit::Kb };
-    persist(&state);
+    let s = {
+        let Some(mut g) = lock_mutex(&state) else { return };
+        g.unit = if unit == "mb" { Unit::Mb } else { Unit::Kb };
+        collect_settings(&g)
+    };
+    s.save();
 }
 
 #[tauri::command]
 fn select_program(state: State<'_, Shared>, key: Option<String>) {
-    state.lock().unwrap().selected = key;
-    persist(&state);
+    let s = {
+        let Some(mut g) = lock_mutex(&state) else { return };
+        g.selected = key;
+        collect_settings(&g)
+    };
+    s.save();
 }
 
 #[tauri::command]
 fn clear_rule(state: State<'_, Shared>, key: String) {
-    state.lock().unwrap().rules.remove(&key);
-    persist(&state);
+    let s = {
+        let Some(mut g) = lock_mutex(&state) else { return };
+        g.rules.remove(&key);
+        collect_settings(&g)
+    };
+    s.save();
 }
 
 #[tauri::command]
 fn set_rule(state: State<'_, Shared>, edit: RuleEdit) {
-    {
-        let mut g = state.lock().unwrap();
+    let s = {
+        let Some(mut g) = lock_mutex(&state) else { return };
         let rule: &mut RuleState = match (edit.target.as_str(), edit.key.as_deref()) {
             ("other", _) => &mut g.other,
             ("program", Some(k)) => g.rules.entry(k.to_string()).or_insert_with(RuleState::new),
@@ -751,8 +800,9 @@ fn set_rule(state: State<'_, Shared>, edit: RuleEdit) {
         if let Some(v) = edit.custom_value {
             ds.custom = v;
         }
-    }
-    persist(&state);
+        collect_settings(&g)
+    };
+    s.save();
 }
 
 #[tauri::command]

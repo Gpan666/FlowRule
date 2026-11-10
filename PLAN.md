@@ -422,4 +422,49 @@ release 仍是 GUI 子系统、内嵌图标，约 4.7MB。
 snapshot 增 `elevated`）、`Cargo.toml`（补 `serde_json`）、`frontend/index.html` +
 `app.js` + `styles.css`（提权横幅）。`tools/check_manifest.py` 仅作 PE manifest 校验用，不影响构建。
 
+### 11.7 紧急修复：非管理员/管理员点击限速控件整窗冻结（2026-11-10 18:30）
+
+用户反馈「以管理员运行后，点击和限速有关的会卡死软件」。**与权限无关**，11.6 引入
+`persist()` 时才带进来的回归。用 `tools/verify_no_freeze.mjs`（CDP 直接对每个 Tauri
+命令计时）做对照实验，旧版实测：
+
+```
+[PASS] get_snapshot       OK 54ms
+[FAIL] set_unit(MB/s)     TIMEOUT 3001ms   ← 自死锁
+[FAIL] 之后所有命令        TIMEOUT           ← 锁永不释放，整窗冻结
+settings.json  NOT FOUND
+```
+
+**根因 A：Mutex 自死锁（致命）**
+`set_unit` 写成 `let mut g = state.lock().unwrap(); ... persist(&state);`，
+这个**命名 guard 活到函数末尾**，而 `persist()` 内部又 `state.lock()` 一次。
+`std::sync::Mutex` 不可重入 → 命令线程永久阻塞且锁永不释放；前台每 220ms 的
+`get_snapshot`、后台线程、后续所有点击全部排队阻塞 → 整个窗口冻结。
+其余命令用的是临时 guard（语句末即释放）才侥幸没死。
+修复：所有命令统一「锁内改状态 + 锁内 `collect_settings()` 取快照 → **出锁后** `s.save()`」，
+删掉 `persist()` 这个二次加锁辅助函数。
+
+**根因 B：`set_rule` 参数绑定错误（隐藏更深）**
+Rust 签名是单个 `edit: RuleEdit`，前端却一直传平铺参数，`call()` 的 `.catch()` 又把
+`missing required key edit` 静默吞掉 → **挡位 chips / 方向开关 / 自定义输入从来没生效过**。
+这才是上一轮「预设挡位没反应」的真凶之一。修复：前端三处改成 `act('set_rule', { edit })`，
+并给 `call()` 加去重节流的前端错误 toast（`.err-toast`），杜绝「点了没反应又没提示」。
+
+**根因 C：管理员下引擎真跑起来后的连锁风险（预防性加固）**
+- `get_snapshot` 原在持锁时调 `fill_icons(24)`（`SHGetFileInfoW`/`GetDIBits`，慢 Win32）
+  → 改为锁内取待办清单、**锁外提取**、回锁内写缓存；
+- `IsUserAnAdmin()` 原在 `snapshot()` 里每 220ms 调一次 → 改为 `Inner.elevated` 启动时探一次；
+- 后台线程原在「有包」分支完全不 sleep，持续流量下高频抢 shared 锁 → 统一让出 1ms；
+- **所有加锁统一走 `lock_mutex()`（try_lock 轮询，200ms 超时）**，命令拿不到锁就跳过本轮，
+  `get_snapshot` 返回 `None`（前端已有 `if (s) render(s)`，天然兼容，保留上一帧）。
+  即便将来某处再次持锁不放，界面最多停顿 200ms，也不会整窗冻结。
+
+**最终验证**（`node tools/verify_no_freeze.mjs`，修复版）：9 个命令全部 PASS（2–39ms），
+`settings.json` 落盘 `unit=mb / master=true / other.down=p3+enabled`；
+`tools/verify_ui.py` 主题切换、拖拽 `(119,96)`、截图均正常，无残留进程。
+
+> 开发机又出现一次 `AppCompatFlags\Layers` 的 `RUNASADMIN` 残留导致 `spawn EACCES`
+> （提权运行后 Windows 会重新写入），已再次删除。用户机器不受影响。
+
+
 
