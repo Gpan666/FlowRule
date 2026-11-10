@@ -82,39 +82,50 @@ $userRoots = @(Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue
                 ForEach-Object { $_.FullName })
 
 $cargoCandidates = New-Object System.Collections.ArrayList
-# 1) 环境变量显式指定（优先级最高）
-if ($env:CNB_CARGO_HOME) {
-    [void]$cargoCandidates.Add((Join-Path $env:CNB_CARGO_HOME 'bin\cargo.exe'))
-}
-# 2) 当前账户
-[void]$cargoCandidates.Add((Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'))
-# 3) rustup 工具链里的真实 cargo（不依赖 rustup shim，最稳）
+# 1) rustup 工具链里的**真实** cargo.exe —— 首选。
+#    它不经过 rustup shim，不需要 default toolchain 配置，最稳。
 foreach ($u in $userRoots) {
     $rh = Join-Path $u '.rustup\toolchains'
-    if (-not (Test-Path $rh)) { continue }
-    foreach ($tc in (Get-ChildItem $rh -Directory -ErrorAction SilentlyContinue)) {
+    if (-not (Test-Path -LiteralPath $rh -ErrorAction SilentlyContinue)) { continue }
+    foreach ($tc in (Get-ChildItem -LiteralPath $rh -Directory -ErrorAction SilentlyContinue)) {
         [void]$cargoCandidates.Add((Join-Path $tc.FullName 'bin\cargo.exe'))
     }
 }
-# 4) 其他用户目录下的 .cargo shim
-foreach ($u in $userRoots) {
+# 2) 环境变量显式指定
+if ($env:CNB_CARGO_HOME) {
+    [void]$cargoCandidates.Add((Join-Path $env:CNB_CARGO_HOME 'bin\cargo.exe'))
+}
+# 3) 各用户目录下的 rustup shim（可能因没设 default toolchain 而不可用，靠下面的探测排除）
+foreach ($u in @($env:USERPROFILE) + $userRoots) {
     [void]$cargoCandidates.Add((Join-Path $u '.cargo\bin\cargo.exe'))
 }
 
+# 逐个候选实跑 `cargo --version`，只接受真能用的那个。
+# 注意：不能只判断文件存在 —— rustup shim 在没有 default toolchain 时是「存在但不可用」的，
+# 之前就是踩了这个坑：systemprofile 下有一次装失败的半成品 shim，被选中后直接报错。
 foreach ($c in $cargoCandidates) {
-    # 某些系统目录（如 LocalSystem 的 profile）无权访问，Test-Path 会直接报错，
-    # 这里统一吞掉错误，只把真正存在的候选纳入考虑。
-    if (Test-Path -LiteralPath $c -ErrorAction SilentlyContinue) { $cargoExe = $c; break }
+    if (-not (Test-Path -LiteralPath $c -ErrorAction SilentlyContinue)) { continue }
+    $ver = ''
+    try {
+        $ver = (& $c --version 2>&1 | Out-String).Trim()
+    } catch { $ver = '' }
+    if ($ver -match '^cargo\s+\d') {
+        $cargoExe = $c
+        Write-Step "cargo 候选可用：$c（$ver）"
+        break
+    }
 }
 
 if (-not $cargoExe) {
-    Write-Step "未找到 cargo，尝试用 rustup 安装 (stable-x86_64-pc-windows-msvc)"
+    Write-Step "未找到可用的 cargo，尝试用 rustup 安装 (stable-x86_64-pc-windows-msvc)"
     $rustup = Join-Path $env:TEMP 'rustup-init.exe'
     Invoke-WebRequest -Uri 'https://win.rustup.rs/x86_64' -OutFile $rustup -UseBasicParsing
     & $rustup -y --default-toolchain stable-x86_64-pc-windows-msvc --profile minimal
     if ($LASTEXITCODE -ne 0) { throw "rustup 安装失败（exit $LASTEXITCODE）" }
     $cargoExe = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'
-    if (-not (Test-Path $cargoExe)) { throw "rustup 安装后仍找不到 cargo：$cargoExe" }
+    if (-not (Test-Path -LiteralPath $cargoExe -ErrorAction SilentlyContinue)) {
+        throw "rustup 安装后仍找不到 cargo：$cargoExe"
+    }
 }
 
 # 推断 CARGO_HOME / RUSTUP_HOME
@@ -122,20 +133,20 @@ if (-not $cargoExe) {
 #   cargo.exe 位于 <home>\.rustup\toolchains\<tc>\bin\ → home = <home>
 $toolchainBin = Split-Path -Parent $cargoExe
 $userHome = $null
-if (Test-Path (Join-Path $toolchainBin 'rustc.exe')) {
-    $tcRoot = Split-Path -Parent (Split-Path -Parent $toolchainBin)
-    if ((Split-Path -Leaf $tcRoot) -eq 'toolchains') {
-        $userHome = Split-Path -Parent (Split-Path -Parent $tcRoot)
-        $rustupHome = Join-Path $userHome '.rustup'
-    }
-} elseif ((Split-Path -Leaf $toolchainBin) -eq 'bin') {
+$tcRoot = Split-Path -Parent (Split-Path -Parent $toolchainBin)
+if ((Split-Path -Leaf $tcRoot) -eq 'toolchains') {
+    # <home>\.rustup\toolchains\<tc>\bin\cargo.exe
+    $userHome = Split-Path -Parent (Split-Path -Parent $tcRoot)
+    $rustupHome = Join-Path $userHome '.rustup'
+} else {
+    # <home>\.cargo\bin\cargo.exe（rustup shim）
     $cargoHome = Split-Path -Parent $toolchainBin
     $userHome = Split-Path -Parent $cargoHome
 }
 if (-not $cargoHome -and $userHome) { $cargoHome = Join-Path $userHome '.cargo' }
 if (-not $rustupHome -and $userHome) { $rustupHome = Join-Path $userHome '.rustup' }
-if ($cargoHome -and (Test-Path $cargoHome)) { $env:CARGO_HOME = $cargoHome }
-if ($rustupHome -and (Test-Path $rustupHome)) { $env:RUSTUP_HOME = $rustupHome }
+if ($cargoHome -and (Test-Path -LiteralPath $cargoHome -ErrorAction SilentlyContinue)) { $env:CARGO_HOME = $cargoHome }
+if ($rustupHome -and (Test-Path -LiteralPath $rustupHome -ErrorAction SilentlyContinue)) { $env:RUSTUP_HOME = $rustupHome }
 
 # 把工具链 bin 加进 PATH，rustc 与 link.exe 配套环境都在同级
 if (Test-Path (Join-Path $toolchainBin 'rustc.exe')) {
