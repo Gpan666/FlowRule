@@ -29,6 +29,16 @@ try {
 $workspace = (Resolve-Path $env:CNB_BUILD_WORKSPACE).Path
 Set-Location $workspace
 
+# 唯一后缀：CNB 可能同时跑多个流水线（push 与 tag_push 并发），
+# 若共用固定的 %TEMP%\liulv-src / liulv-stage 会互相抢占目录导致构建失败。
+# 这里用构建号 + 进程号做后缀，彻底隔离并发构建。
+$buildTag = ''
+foreach ($v in @($env:CNB_BUILD_ID, $env:CNB_PIPELINE_ID, $env:CNB_BUILD_SN)) {
+    if ($v) { $buildTag = ($v -replace '[^A-Za-z0-9_\-]', '_'); break }
+}
+if (-not $buildTag) { $buildTag = 'local' }
+$uniq = "$buildTag-$PID"
+
 function Write-Step($msg) { Write-Host "==> $msg" }
 
 # ---------------------------------------------------------------- 0. 环境自检
@@ -58,11 +68,13 @@ try {
 #     本仓库路径含中文，MSVC/GNU 工具链在部分环节（资源编译、链接）会因
 #     非 ASCII 路径失败；仓库内 .cargo/config.toml 也因此把 target-dir 写死。
 #     这里用 git archive 导出一份到 %TEMP% 下的纯 ASCII 目录，彻底规避。
-$asciiSrc = Join-Path $env:TEMP 'liulv-src'
-if (Test-Path $asciiSrc) { Remove-Item -LiteralPath $asciiSrc -Recurse -Force }
+$asciiSrc = Join-Path $env:TEMP ('liulv-src-' + $uniq)
+if (Test-Path $asciiSrc) {
+    Remove-Item -LiteralPath $asciiSrc -Recurse -Force -ErrorAction SilentlyContinue
+}
 New-Item -ItemType Directory -Force -Path $asciiSrc | Out-Null
-$tarPath = Join-Path $env:TEMP 'liulv-src.tar'
-if (Test-Path $tarPath) { Remove-Item -LiteralPath $tarPath -Force }
+$tarPath = Join-Path $env:TEMP ('liulv-src-' + $uniq + '.tar')
+if (Test-Path $tarPath) { Remove-Item -LiteralPath $tarPath -Force -ErrorAction SilentlyContinue }
 git archive --format=tar -o $tarPath $target
 if ($LASTEXITCODE -ne 0) { throw "git archive 失败（exit $LASTEXITCODE）" }
 tar -xf $tarPath -C $asciiSrc
@@ -197,8 +209,10 @@ try {
 # ---------------------------------------------------------------- 2. 收集运行时文件
 # 在 %TEMP% 下的独立暂存目录组装，避免工作区里的 dist\rl-app.exe 正被运行中的
 # 程序占用（Copy-Item 会因文件锁直接失败），也避免污染仓库工作区。
-$stage = Join-Path $env:TEMP 'liulv-stage'
-if (Test-Path $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
+$stage = Join-Path $env:TEMP ('liulv-stage-' + $uniq)
+if (Test-Path $stage) {
+    Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+}
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 Copy-Item -LiteralPath $exe -Destination (Join-Path $stage 'rl-app.exe') -Force
 
@@ -244,3 +258,10 @@ $meta = @{
 )
 
 Write-Step "构建完成：$zipName"
+
+# 清理本次构建独占的临时目录（并发构建不会互相影响）
+foreach ($d in @($asciiSrc, $stage)) {
+    if ($d -and (Test-Path -LiteralPath $d -ErrorAction SilentlyContinue)) {
+        Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
