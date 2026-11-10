@@ -58,19 +58,21 @@ main:
             & "$env:CNB_BUILD_WORKSPACE\tools\ci\upload-artifact.ps1" -Mode commit
 
 # ── 推 v* Tag：构建 + 建 Release ───────────────────────────────────────────
-$:
-  v*:
-    tag_push:
-      - name: build-and-release
-        runner:
-          namespace: group
-          tags:
-            - windows
-        stages:
-          - name: build
-            script: |
-              & "$env:CNB_BUILD_WORKSPACE\tools\ci\build-win.ps1"
+# 注意：tag_push 的 glob 模式（v*）是**顶层键**，不能嵌在 $ 下面。
+#       （$ 只是「未被 glob 匹配时的兜底」，嵌套写法不会被解析。）
+#       tag_push 事件里 tag 名存放在 CNB_BRANCH，而不是 CNB_TAG。
+v*:
+  tag_push:
+    - name: build-and-release
+      runner:
+        namespace: group
+        tags:
+          - windows
+      stages:
+        - name: build
+          script: |
+            & "$env:CNB_BUILD_WORKSPACE\tools\ci\build-win.ps1"
 
-          - name: create release and upload asset
-            script: |
-              & "$env:CNB_BUILD_WORKSPACE\tools\ci\upload-artifact.ps1" -Mode release
+        - name: create release and upload asset
+          script: |
+            & "$env:CNB_BUILD_WORKSPACE\tools\ci\upload-artifact.ps1" -Mode release
