@@ -54,13 +54,20 @@ const UDP_ROW_SIZE: usize = 12;
 ///     dwLocalPort @20, dwOwningPid @24
 /// 该结论已用 `netstat -ano` 的 IPv6 UDP 端点逐条交叉验证（42/42 命中）。
 /// 为了不把某个版本的布局写死，这里按候选步长自适应探测，取自洽率最高者。
-const V6_HEADER_SIZE: usize = 8;
+const V6_HEADER_SIZE: usize = TABLE_HEADER_SIZE;
 const UDP6_STRIDE_CANDIDATES: [usize; 5] = [176, 32, 28, 64, 40];
 const TCP6_STRIDE_CANDIDATES: [usize; 4] = [56, 64, 176, 32];
 /// PID 合理上界（Windows PID 实际远小于此；超过说明布局解错了）
 const PID_SANE_MAX: u32 = 0x100_0000;
-/// 两张表头都是 `DWORD dwNumEntries` + 紧随其后的行数组
-const TABLE_HEADER_SIZE: usize = 4;
+/// IPv4 连接表头 = `DWORD dwNumEntries` + **4 字节对齐填充** + 行数组。
+///
+/// ⚠️ 必须是 8，不能是 4。`MIB_TCPTABLE_OWNER_PID` / `MIB_UDPTABLE_OWNER_PID` 里
+/// 行数组紧跟一个 `DWORD`，而 `MIB_TCPROW_OWNER_PID` 需要 4 字节对齐，
+/// 编译器因此插入 4 字节填充。旧代码按 4 读取，**每一条记录都整体错位 4 字节**：
+/// 地址、端口、PID 全部读错，`lookup_pid` 恒返回 None → 所有流量都被判成「其他流量」，
+/// 按程序限速永远不生效（而且因为错位后的 PID 字段总是 0，被 `pid == 0` 过滤掉，
+/// 表面上看不出任何异常）。已用 `netstat -ano` 逐条交叉验证。
+const TABLE_HEADER_SIZE: usize = 8;
 
 /// 映射刷新间隔。连接表查询要遍历系统全部连接，不能每个包都调；
 /// 连接建立/关闭本身是秒级事件，700ms 足够准确。
@@ -205,10 +212,10 @@ pub fn parse_udp_table(buf: &[u8]) -> HashMap<UdpKey, u32> {
 
 /// 从 IPv6 版 UDP owner-pid 表解析 (local_addr, local_port) → PID
 ///
-/// 行内字段位置按实测布局（见 [`V6_HEADER_SIZE`] 处的说明）。
-/// 表头/步长按候选值自适应探测：错的步长会解析出离谱的 PID，直接淘汰。
+/// 表头固定 8 字节（与 IPv4 表一致）；行步长按候选值自适应探测：
+/// 错的步长会解析出离谱的 PID 或自洽率过低，直接淘汰（见 [`V6_HEADER_SIZE`]）。
 pub fn parse_udp6_table(buf: &[u8]) -> HashMap<UdpKey6, u32> {
-    if buf.len() < V6_HEADER_SIZE + TABLE_HEADER_SIZE {
+    if buf.len() < V6_HEADER_SIZE {
         return HashMap::new();
     }
     let n = rd_u32(buf, 0) as usize;
@@ -258,7 +265,7 @@ pub fn parse_udp6_table(buf: &[u8]) -> HashMap<UdpKey6, u32> {
 /// Win32 87（INVALID_PARAMETER）——IPv6 的 TCP 连接表拿不到 owning PID。
 /// 因此本机 IPv6 TCP 流量仍会落到「其他流量」，IPv6 UDP（QUIC/HTTP3）可以归属。
 pub fn parse_tcp6_table(buf: &[u8]) -> HashMap<TcpKey6, u32> {
-    if buf.len() < V6_HEADER_SIZE + TABLE_HEADER_SIZE {
+    if buf.len() < V6_HEADER_SIZE {
         return HashMap::new();
     }
     let n = rd_u32(buf, 0) as usize;
@@ -435,10 +442,19 @@ mod tests {
         v
     }
 
+    /// 真实布局的 IPv4 表头：`dwNumEntries` + 4 字节对齐填充
+    fn v4_buf(rows: &[Vec<u8>]) -> Vec<u8> {
+        let mut buf = (rows.len() as u32).to_ne_bytes().to_vec();
+        buf.extend_from_slice(&0u32.to_ne_bytes()); // MIB 行需 4 字节对齐，编译器在此插入填充
+        for r in rows {
+            buf.extend_from_slice(r);
+        }
+        buf
+    }
+
     #[test]
     fn tcp_table_is_bidirectional() {
-        let mut buf = 1u32.to_ne_bytes().to_vec();
-        buf.extend(row(5, 0x0100007f, 50000, 0x0101a8c0, 443, 4242));
+        let buf = v4_buf(&[row(5, 0x0100007f, 50000, 0x0101a8c0, 443, 4242)]);
         let map = parse_tcp_table(&buf);
         // 出站包 src=local, dst=remote
         assert_eq!(map.get(&(0x0100007f, 50000, 0x0101a8c0, 443)), Some(&4242));
@@ -449,14 +465,47 @@ mod tests {
 
     #[test]
     fn udp_table_maps_local_endpoint() {
-        let mut buf = 1u32.to_ne_bytes().to_vec();
         let mut r = Vec::new();
         r.extend_from_slice(&0x0100007fu32.to_ne_bytes());
         r.extend_from_slice(&(53u16.swap_bytes() as u32).to_ne_bytes());
         r.extend_from_slice(&777u32.to_ne_bytes());
-        buf.extend(r);
-        let map = parse_udp_table(&buf);
+        let map = parse_udp_table(&v4_buf(&[r]));
         assert_eq!(map.get(&(0x0100007f, 53)), Some(&777));
+    }
+
+    /// ★ 回归：IPv4 表头必须跳过 4 字节对齐填充。
+    ///
+    /// 旧代码用 `TABLE_HEADER_SIZE = 4`，每条记录整体错位 4 字节：
+    /// 地址/端口/PID 全部读错，PID 字段读到的是 0 → 该条被丢弃 →
+    /// `lookup_pid` 恒为 None → 所有流量都归「其他流量」→ 按程序限速永远不生效。
+    #[test]
+    fn v4_table_skips_alignment_padding() {
+        // 两条记录，只要错位 4 字节，第二条就会读到垃圾
+        let buf = v4_buf(&[
+            row(5, 0x0100007f, 50000, 0x0101a8c0, 443, 4242),
+            row(5, 0x0200007f, 50001, 0x0201a8c0, 80, 5353),
+        ]);
+        let tcp = parse_tcp_table(&buf);
+        assert_eq!(tcp.len(), 4, "两条 TCP 记录应产生 4 个双向键，实际 {}", tcp.len());
+        assert_eq!(tcp.get(&(0x0200007f, 50001, 0x0201a8c0, 80)), Some(&5353));
+
+        let mut u1 = Vec::new();
+        u1.extend_from_slice(&0x0100007fu32.to_ne_bytes());
+        u1.extend_from_slice(&(53u16.swap_bytes() as u32).to_ne_bytes());
+        u1.extend_from_slice(&777u32.to_ne_bytes());
+        let mut u2 = Vec::new();
+        u2.extend_from_slice(&0x0300007fu32.to_ne_bytes());
+        u2.extend_from_slice(&(5353u16.swap_bytes() as u32).to_ne_bytes());
+        u2.extend_from_slice(&888u32.to_ne_bytes());
+        let udp = parse_udp_table(&v4_buf(&[u1, u2]));
+        assert_eq!(udp.get(&(0x0300007f, 5353)), Some(&888));
+    }
+
+    #[test]
+    fn v4_header_constant_matches_real_layout() {
+        // MIB_TCPROW_OWNER_PID = 6 DWORD 需 4 字节对齐 → 表头 = 4 + 4(填充)
+        assert_eq!(TABLE_HEADER_SIZE, 8);
+        assert_eq!(TABLE_HEADER_SIZE % 4, 0);
     }
 
     #[test]

@@ -278,10 +278,14 @@ impl DirHandle {
     /// 下载时上行只有零星 ACK，收下行后就会卡在上行 recv 上，直到下一个 ACK
     /// 才继续处理一个下行包 → 整机吞吐被压到「每 RTT 一个包」的量级。
     /// 这就是「只限一个程序，整台电脑却像被限速」的真正原因。
+    ///
+    /// 排空队列时传 `timeout_ms = 0`：只在包**已经**就绪时取走，绝不阻塞。
     fn recv(&mut self, timeout_ms: u32) -> Result<Option<usize>, String> {
         let api = api()?;
         if !self.recv_pending {
-            // 上一次若同步完成，事件可能仍处于置位状态；先清掉，避免本轮误判为已完成
+            // 上一次若同步完成，事件可能仍处于置位状态；先清掉，避免本轮误判为已完成。
+            // ⚠️ 只在「没有挂起请求」时清事件：驱动已经置位的事件若被清掉，
+            // 下一次 WaitForSingleObject 会一直等下去（表现为该方向彻底收不到包）。
             unsafe { ResetEvent(self.h_event) };
             *self.recv_len = 0;
             *self.addr_len = std::mem::size_of::<Address>() as u32;
@@ -737,60 +741,95 @@ impl Engine for WinDivertEngine {
     }
 
     /// 轮询两个全局句柄，最多处理 max_packets 个包。
+    ///
+    /// ## 为什么必须「分方向」而不是「每轮各取一个包」
+    ///
+    /// 两个方向各只有一个收包请求可以挂在驱动里。旧实现每轮循环对每个句柄
+    /// 各取 **1 个**包，然后读一次 out 时间：
+    /// 下行方向在高流量下队列里堆着成千上万个包，却和上行方向平分吞吐配额，
+    /// 于是下行实际速度被压到「上行包数 × 单个处理能力」——表现为限速值完全不准、
+    /// 甚至下载几乎卡死。
+    ///
+    /// 现在改成：每轮先把一个方向**排空**（在预算内），再去处理另一个方向。
+    /// 队列里已有包时用 0 超时立即取走，循环期间绝不阻塞，
+    /// 保证 `poll` 的「非阻塞」语义，后台线程不会被卡住（旧注释说的「串联阻塞」根因）。
     fn poll(&mut self, max_packets: usize) -> Result<usize, String> {
         if self.handles.is_empty() {
             return Ok(0);
         }
         self.proc_map.refresh_if_due(Instant::now());
 
+        let mut budget = max_packets;
         let mut handled = 0;
-        for _ in 0..max_packets {
+        let mut first_err: Option<String> = None;
+
+        while budget > 0 {
             let mut idle = true;
             for i in 0..self.handles.len() {
-                let h = &mut self.handles[i];
-                let Some(len) = h.recv(0)? else {
-                    continue;
-                };
-                idle = false;
-                handled += 1;
-                self.diag.packets += 1;
-                let dir = h.dir;
-
-                let key = classify(&self.proc_map, &self.pid_key, &h.buf[..len], dir);
-                if key != OTHER {
-                    self.diag.program_hits += 1;
-                }
-                let bucket_key = pick_bucket(&self.buckets, &key, dir);
-                if bucket_key.is_some() {
-                    self.diag.limited += 1;
-                }
-                let pass = match &bucket_key {
-                    Some(bk) => self.buckets.get_mut(bk).map(|b| b.try_consume(len as u64)).unwrap_or(true),
-                    None => true,
-                };
-                if !pass {
-                    self.diag.dropped += 1;
-                }
-
-                if pass {
-                    h.reinject(len)?;
-                    // 统计用「程序 key」而非实际桶：界面上该程序能看到自己的实时速率，
-                    // 即使它走的是「其他流量」兜底。
-                    let sk = (key, dir);
-                    let counter = match self.counters.get(&sk) {
-                        Some(c) => c.clone(),
-                        None => {
-                            let c = Arc::new(ByteCounter::new());
-                            self.counters.insert(sk.clone(), c.clone());
-                            if let Ok(mut m) = self.stats.lock() {
-                                m.insert(sk.clone(), c.clone());
-                            }
-                            c
+                while budget > 0 {
+                    let h = &mut self.handles[i];
+                    let len = match h.recv(0) {
+                        Ok(Some(len)) => len,
+                        Ok(None) => break,
+                        Err(e) => {
+                            first_err.get_or_insert(e);
+                            break;
                         }
                     };
-                    counter.add(len as u64);
+                    idle = false;
+                    budget -= 1;
+                    handled += 1;
+                    self.diag.packets += 1;
+
+                    let dir = h.dir;
+                    let key = classify(&self.proc_map, &self.pid_key, &h.buf[..len], dir);
+                    if key != OTHER {
+                        self.diag.program_hits += 1;
+                    }
+                    let bucket_key = pick_bucket(&self.buckets, &key, dir);
+                    if bucket_key.is_some() {
+                        self.diag.limited += 1;
+                    }
+                    let pass = match &bucket_key {
+                        Some(bk) => self
+                            .buckets
+                            .get_mut(bk)
+                            .map(|b| b.try_consume(len as u64))
+                            .unwrap_or(true),
+                        None => true,
+                    };
+                    if !pass {
+                        self.diag.dropped += 1;
+                    }
+
+                    if pass {
+                        if let Err(e) = h.reinject(len) {
+                            // 单个包重注入失败（驱动队列满等）不代表整轮失败，
+                            // 记下第一个错误继续处理，保证其它包不受牵连。
+                            first_err.get_or_insert(e);
+                            continue;
+                        }
+                        // 统计用「程序 key」而非实际桶：界面上该程序能看到自己的实时速率，
+                        // 即使它走的是「其他流量」兜底。
+                        let sk = (key, dir);
+                        let counter = match self.counters.get(&sk) {
+                            Some(c) => c.clone(),
+                            None => {
+                                let c = Arc::new(ByteCounter::new());
+                                self.counters.insert(sk.clone(), c.clone());
+                                if let Ok(mut m) = self.stats.lock() {
+                                    m.insert(sk.clone(), c.clone());
+                                }
+                                c
+                            }
+                        };
+                        counter.add(len as u64);
+                    }
+                    // 令牌不足：直接不重注入（丢弃），TCP 触发拥塞控制自然降速
                 }
-                // 令牌不足：直接不重注入（丢弃），TCP 触发拥塞控制自然降速
+                if budget == 0 {
+                    break;
+                }
             }
             if idle {
                 break;
@@ -801,7 +840,13 @@ impl Engine for WinDivertEngine {
         if let Some(e) = self.proc_map.last_error() {
             self.warning = Some(format!("进程识别不可用（{}），按程序限速可能不准确", e));
         }
-        Ok(handled)
+
+        match first_err {
+            // 已经处理过包就先把结果交回去，下次 poll 再报错，避免丢掉已完成的统计
+            Some(e) if handled == 0 => Err(e),
+            Some(_) => Ok(handled),
+            None => Ok(handled),
+        }
     }
 }
 
