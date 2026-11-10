@@ -27,22 +27,23 @@ function Write-Step($msg) { Write-Host "==> $msg" }
 # ---------------------------------------------------------------- 0. 环境自检
 Write-Step "工作区: $workspace"
 
-# 0.1 对齐到触发本次构建的提交
-#     pull_request.merged 事件的 CNB_COMMIT 是合并后的 SHA，工作区可能还停在别处。
+# 0.1 确认触发本次构建的提交在本地可见
+#     pull_request.merged 事件的 CNB_COMMIT 是合并后的 SHA。
+#     不做 checkout（避免把工作区切成 detached HEAD 影响后续 stage），
+#     真正编译用的是下面 git archive 导出的干净副本。
 $target = $env:CNB_COMMIT
 if (-not $target) { $target = 'HEAD' }
 try {
     git rev-parse --verify "$target^{commit}" *> $null
     if ($LASTEXITCODE -ne 0) { git fetch --no-tags origin $target *> $null }
     if ((git cat-file -t $target 2>$null) -eq 'commit') {
-        git checkout --detach --force $target
-        Write-Step "已 checkout 到 $target"
+        Write-Step "目标提交：$target"
     } else {
-        Write-Step "本地找不到 $target，沿用工作区现状"
+        Write-Step "本地找不到 $target，改用 HEAD"
         $target = 'HEAD'
     }
 } catch {
-    Write-Step "对齐提交失败（$($_.Exception.Message)），沿用工作区现状"
+    Write-Step "定位提交失败（$($_.Exception.Message)），改用 HEAD"
     $target = 'HEAD'
 }
 
