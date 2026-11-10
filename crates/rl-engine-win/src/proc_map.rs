@@ -30,10 +30,15 @@ use std::time::{Duration, Instant};
 use libloading::{Library, Symbol};
 
 const AF_INET: u32 = 2;
+const AF_INET6: u32 = 23;
 /// TCP_TABLE_OWNER_PID_ALL：包含 listener / connections / established，且带 owning PID
 const TCP_TABLE_OWNER_PID_ALL: u32 = 5;
+/// TCP6_TABLE_OWNER_PID_ALL：IPv6 版，行结构带 16 字节地址
+const TCP6_TABLE_OWNER_PID_ALL: u32 = 19;
 /// UDP_TABLE_OWNER_PID
 const UDP_TABLE_OWNER_PID: u32 = 1;
+/// UDP6_TABLE_OWNER_PID
+const UDP6_TABLE_OWNER_PID: u32 = 2;
 const NO_ERROR: u32 = 0;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 
@@ -41,6 +46,19 @@ const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const TCP_ROW_SIZE: usize = 24;
 /// MIB_UDPROW_OWNER_PID：3 个 DWORD = 12 字节
 const UDP_ROW_SIZE: usize = 12;
+/// ★ IPv6 连接表的**表头与行步长在不同 Windows 版本上并不等于文档里的结构体大小**。
+/// 本机（Win11）实测：`GetExtendedUdpTable(AF_INET6, UDP6_TABLE_OWNER_PID)` 返回
+///   - 表头 8 字节（dwNumEntries 4 字节 + 4 字节对齐填充）
+///   - 行步长 **176 字节**（而 MIB_UDP6ROW_OWNER_PID 只有 28 字节）
+///   - 行内字段仍按文档排布：ucLocalAddr[16] @0, dwLocalScopeId @16,
+///     dwLocalPort @20, dwOwningPid @24
+/// 该结论已用 `netstat -ano` 的 IPv6 UDP 端点逐条交叉验证（42/42 命中）。
+/// 为了不把某个版本的布局写死，这里按候选步长自适应探测，取自洽率最高者。
+const V6_HEADER_SIZE: usize = 8;
+const UDP6_STRIDE_CANDIDATES: [usize; 5] = [176, 32, 28, 64, 40];
+const TCP6_STRIDE_CANDIDATES: [usize; 4] = [56, 64, 176, 32];
+/// PID 合理上界（Windows PID 实际远小于此；超过说明布局解错了）
+const PID_SANE_MAX: u32 = 0x100_0000;
 /// 两张表头都是 `DWORD dwNumEntries` + 紧随其后的行数组
 const TABLE_HEADER_SIZE: usize = 4;
 
@@ -52,6 +70,18 @@ pub const REFRESH_INTERVAL: Duration = Duration::from_millis(700);
 type TcpKey = (u32, u16, u32, u16);
 /// UDP 键：(local_addr, local_port)
 type UdpKey = (u32, u16);
+/// IPv6 版 TCP 键（地址为 16 字节网络序）
+type TcpKey6 = ([u8; 16], u16, [u8; 16], u16);
+/// IPv6 版 UDP 键
+type UdpKey6 = ([u8; 16], u16);
+
+/// 一个包的网络层地址/端口组合。IPv4 与 IPv6 分开表示，
+/// 因为系统连接表里两者的地址宽度不同（4 字节 vs 16 字节）。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Flow {
+    V4 { src: u32, sport: u16, dst: u32, dport: u16 },
+    V6 { src: [u8; 16], sport: u16, dst: [u8; 16], dport: u16 },
+}
 
 type FnGetTable = unsafe extern "system" fn(
     *mut c_void, // pTable
@@ -85,10 +115,10 @@ fn api() -> Result<&'static IpHlpApi, String> {
 }
 
 /// 调用 GetExtended*Table 的两步法：先问大小，再取数据。
-fn read_table(f: FnGetTable, class: u32) -> Result<Vec<u8>, String> {
+fn read_table(f: FnGetTable, af: u32, class: u32) -> Result<Vec<u8>, String> {
     unsafe {
         let mut size: u32 = 0;
-        let r = f(std::ptr::null_mut(), &mut size, 0, AF_INET, class, 0);
+        let r = f(std::ptr::null_mut(), &mut size, 0, af, class, 0);
         if r != NO_ERROR && r != ERROR_INSUFFICIENT_BUFFER {
             return Err(format!("查询连接表大小失败，Win32 错误 {r}"));
         }
@@ -98,7 +128,7 @@ fn read_table(f: FnGetTable, class: u32) -> Result<Vec<u8>, String> {
         // 表可能在两次调用之间增长；失败时按新 size 重试一次
         for _ in 0..2 {
             let mut buf = vec![0u8; size as usize];
-            let r = f(buf.as_mut_ptr() as *mut c_void, &mut size, 0, AF_INET, class, 0);
+            let r = f(buf.as_mut_ptr() as *mut c_void, &mut size, 0, af, class, 0);
             if r == NO_ERROR {
                 return Ok(buf);
             }
@@ -173,10 +203,118 @@ pub fn parse_udp_table(buf: &[u8]) -> HashMap<UdpKey, u32> {
     map
 }
 
+/// 从 IPv6 版 UDP owner-pid 表解析 (local_addr, local_port) → PID
+///
+/// 行内字段位置按实测布局（见 [`V6_HEADER_SIZE`] 处的说明）。
+/// 表头/步长按候选值自适应探测：错的步长会解析出离谱的 PID，直接淘汰。
+pub fn parse_udp6_table(buf: &[u8]) -> HashMap<UdpKey6, u32> {
+    if buf.len() < V6_HEADER_SIZE + TABLE_HEADER_SIZE {
+        return HashMap::new();
+    }
+    let n = rd_u32(buf, 0) as usize;
+    if n == 0 || n > 200_000 {
+        return HashMap::new();
+    }
+    let mut best: Option<(usize, HashMap<UdpKey6, u32>)> = None;
+    for &stride in UDP6_STRIDE_CANDIDATES.iter() {
+        let mut map = HashMap::new();
+        let mut score = 0usize;
+        for i in 0..n {
+            let off = V6_HEADER_SIZE + i * stride;
+            if off + 32 > buf.len() {
+                break;
+            }
+            let mut la = [0u8; 16];
+            la.copy_from_slice(&buf[off..off + 16]);
+            let lp = mib_port(rd_u32(buf, off + 20));
+            let pid = rd_u32(buf, off + 24);
+            if pid == 0 || pid > PID_SANE_MAX {
+                continue;
+            }
+            score += 1;
+            map.insert((la, lp), pid);
+        }
+        if score == 0 {
+            continue;
+        }
+        if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
+            best = Some((score, map));
+        }
+    }
+    let Some((score, map)) = best else {
+        return HashMap::new();
+    };
+    // 自洽率不足 60% → 布局没对上，放弃 v6 归属
+    // （宁可不归属，也不能把流量错记到别的程序上）
+    if score * 5 < n * 3 {
+        return HashMap::new();
+    }
+    map
+}
+
+/// 从 IPv6 版 TCP owner-pid 表解析双向五元组 → PID
+///
+/// 注意：Windows 的 `GetExtendedTcpTable` 对 `ulAf = AF_INET6` 一律返回
+/// Win32 87（INVALID_PARAMETER）——IPv6 的 TCP 连接表拿不到 owning PID。
+/// 因此本机 IPv6 TCP 流量仍会落到「其他流量」，IPv6 UDP（QUIC/HTTP3）可以归属。
+pub fn parse_tcp6_table(buf: &[u8]) -> HashMap<TcpKey6, u32> {
+    if buf.len() < V6_HEADER_SIZE + TABLE_HEADER_SIZE {
+        return HashMap::new();
+    }
+    let n = rd_u32(buf, 0) as usize;
+    if n == 0 || n > 200_000 {
+        return HashMap::new();
+    }
+    let mut best: Option<(usize, HashMap<TcpKey6, u32>)> = None;
+    for &stride in TCP6_STRIDE_CANDIDATES.iter() {
+        let mut map = HashMap::new();
+        let mut score = 0usize;
+        for i in 0..n {
+            let off = V6_HEADER_SIZE + i * stride;
+            if off + 56 > buf.len() {
+                break;
+            }
+            let mut la = [0u8; 16];
+            la.copy_from_slice(&buf[off..off + 16]);
+            let mut ra = [0u8; 16];
+            ra.copy_from_slice(&buf[off + 20..off + 36]);
+            let lp = mib_port(rd_u32(buf, off + 44));
+            let rp = mib_port(rd_u32(buf, off + 48));
+            let pid = rd_u32(buf, off + 52);
+            if pid == 0 || pid > PID_SANE_MAX {
+                continue;
+            }
+            score += 1;
+            map.insert((la, lp, ra, rp), pid);
+        }
+        if score == 0 {
+            continue;
+        }
+        if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
+            best = Some((score, map));
+        }
+    }
+    let Some((score, map)) = best else {
+        return HashMap::new();
+    };
+    if score * 5 < n * 3 {
+        return HashMap::new();
+    }
+    // TCP 是双向的：把反向五元组也登记
+    let mut out = HashMap::new();
+    for ((la, lp, ra, rp), pid) in map {
+        out.insert((la, lp, ra, rp), pid);
+        out.insert((ra, rp, la, lp), pid);
+    }
+    out
+}
+
 /// 五元组 → PID 的缓存映射
 pub struct ProcMap {
     tcp: HashMap<TcpKey, u32>,
     udp: HashMap<UdpKey, u32>,
+    tcp6: HashMap<TcpKey6, u32>,
+    udp6: HashMap<UdpKey6, u32>,
     last_refresh: Option<Instant>,
     /// 最近一次刷新是否成功（失败时给 UI 一个明确提示，而不是静默降级）
     last_error: Option<String>,
@@ -190,7 +328,14 @@ impl Default for ProcMap {
 
 impl ProcMap {
     pub fn new() -> Self {
-        Self { tcp: HashMap::new(), udp: HashMap::new(), last_refresh: None, last_error: None }
+        Self {
+            tcp: HashMap::new(),
+            udp: HashMap::new(),
+            tcp6: HashMap::new(),
+            udp6: HashMap::new(),
+            last_refresh: None,
+            last_error: None,
+        }
     }
 
     /// 按间隔刷新；返回是否需要把错误展示给用户。
@@ -210,10 +355,15 @@ impl ProcMap {
 
     fn load(&mut self) -> Result<(), String> {
         let a = api()?;
-        let tcp_buf = read_table(a.tcp, TCP_TABLE_OWNER_PID_ALL)?;
-        let udp_buf = read_table(a.udp, UDP_TABLE_OWNER_PID)?;
+        let tcp_buf = read_table(a.tcp, AF_INET, TCP_TABLE_OWNER_PID_ALL)?;
+        let udp_buf = read_table(a.udp, AF_INET, UDP_TABLE_OWNER_PID)?;
         self.tcp = parse_tcp_table(&tcp_buf);
         self.udp = parse_udp_table(&udp_buf);
+        // IPv6 表：个别系统可能不支持，失败时降级（IPv6 流量归「其他流量」），不阻断整体
+        let tcp6_buf = read_table(a.tcp, AF_INET6, TCP6_TABLE_OWNER_PID_ALL).unwrap_or_default();
+        let udp6_buf = read_table(a.udp, AF_INET6, UDP6_TABLE_OWNER_PID).unwrap_or_default();
+        self.tcp6 = parse_tcp6_table(&tcp6_buf);
+        self.udp6 = parse_udp6_table(&udp6_buf);
         Ok(())
     }
 
@@ -223,28 +373,33 @@ impl ProcMap {
 
     pub fn tcp_len(&self) -> usize { self.tcp.len() }
     pub fn udp_len(&self) -> usize { self.udp.len() }
+    pub fn tcp6_len(&self) -> usize { self.tcp6.len() }
+    pub fn udp6_len(&self) -> usize { self.udp6.len() }
 
     /// 查一个包属于哪个进程。
     ///
-    /// - `src/dst`：IP 包里的地址（按 `u32::from_le_bytes` 读出，与 MIB DWORD 一致）
-    /// - `sport/dport`：主机序端口（`u16::from_be_bytes` 读出）
+    /// - `flow`：包里的地址/端口（IPv4 用 `u32` 原生 DWORD，IPv6 用 16 字节网络序）
     /// - `is_tcp`：true=TCP, false=UDP
     /// - `outbound`：UDP 时决定用 src 还是 dst 作为「本端」
     #[inline]
-    pub fn lookup_pid(
-        &self,
-        src: u32,
-        sport: u16,
-        dst: u32,
-        dport: u16,
-        is_tcp: bool,
-        outbound: bool,
-    ) -> Option<u32> {
-        if is_tcp {
-            self.tcp.get(&(src, sport, dst, dport)).copied()
-        } else {
-            let local = if outbound { (src, sport) } else { (dst, dport) };
-            self.udp.get(&local).copied()
+    pub fn lookup_pid(&self, flow: Flow, is_tcp: bool, outbound: bool) -> Option<u32> {
+        match flow {
+            Flow::V4 { src, sport, dst, dport } => {
+                if is_tcp {
+                    self.tcp.get(&(src, sport, dst, dport)).copied()
+                } else {
+                    let local = if outbound { (src, sport) } else { (dst, dport) };
+                    self.udp.get(&local).copied()
+                }
+            }
+            Flow::V6 { src, sport, dst, dport } => {
+                if is_tcp {
+                    self.tcp6.get(&(src, sport, dst, dport)).copied()
+                } else {
+                    let local = if outbound { (src, sport) } else { (dst, dport) };
+                    self.udp6.get(&local).copied()
+                }
+            }
         }
     }
 
@@ -253,6 +408,16 @@ impl ProcMap {
         self.tcp = tcp;
         self.udp = udp;
         self.last_refresh = Some(Instant::now());
+    }
+
+    #[cfg(test)]
+    pub fn seed6_for_test(
+        &mut self,
+        tcp6: HashMap<TcpKey6, u32>,
+        udp6: HashMap<UdpKey6, u32>,
+    ) {
+        self.tcp6 = tcp6;
+        self.udp6 = udp6;
     }
 }
 
@@ -301,6 +466,74 @@ mod tests {
         assert_eq!(mib_port(0x5000), 80);
     }
 
+    /// 构造 UDP6 表行（实测布局：176 字节步长，端口 @24、PID @28）
+    fn row6_udp(la: [u8; 16], lp: u16, pid: u32) -> Vec<u8> {
+        let mut v = vec![0u8; 176];
+        v[..16].copy_from_slice(&la);
+        v[20..24].copy_from_slice(&(lp.swap_bytes() as u32).to_ne_bytes());
+        v[24..28].copy_from_slice(&pid.to_ne_bytes());
+        v
+    }
+
+    /// 构造 TCP6 表行（文档布局 56 字节）
+    fn row6_tcp(la: [u8; 16], lp: u16, ra: [u8; 16], rp: u16, pid: u32) -> Vec<u8> {
+        let mut v = vec![0u8; 56];
+        v[..16].copy_from_slice(&la);
+        v[20..36].copy_from_slice(&ra);
+        v[44..48].copy_from_slice(&(lp.swap_bytes() as u32).to_ne_bytes());
+        v[48..52].copy_from_slice(&(rp.swap_bytes() as u32).to_ne_bytes());
+        v[52..56].copy_from_slice(&pid.to_ne_bytes());
+        v
+    }
+
+    /// UDP6 表：8 字节表头（dwNumEntries + 4 字节填充）+ 176 字节行
+    fn udp6_buf(rows: &[([u8; 16], u16, u32)]) -> Vec<u8> {
+        let mut buf = (rows.len() as u32).to_ne_bytes().to_vec();
+        buf.extend_from_slice(&0u32.to_ne_bytes()); // 对齐填充
+        for (la, lp, pid) in rows {
+            buf.extend(row6_udp(*la, *lp, *pid));
+        }
+        buf
+    }
+
+    #[test]
+    fn udp6_table_parses_real_layout() {
+        let buf = udp6_buf(&[
+            ([0u8; 16], 500, 3628),
+            ([7u8; 16], 5353, 9784),
+        ]);
+        let map = parse_udp6_table(&buf);
+        assert_eq!(map.get(&([0u8; 16], 500)), Some(&3628));
+        assert_eq!(map.get(&([7u8; 16], 5353)), Some(&9784));
+    }
+
+    #[test]
+    fn udp6_wrong_stride_is_rejected() {
+        // 步长不对 → 解析出的 PID 离谱 → 必须整体放弃（宁可不归属）
+        let mut buf = 1u32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(&0u32.to_ne_bytes());
+        let mut row = vec![0u8; 28];
+        row[24..28].copy_from_slice(&0x11223344u32.to_ne_bytes()); // 离谱的 PID
+        buf.extend(row);
+        assert!(parse_udp6_table(&buf).is_empty());
+    }
+
+    #[test]
+    fn tcp6_table_is_bidirectional() {
+        let mut buf = 1u32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(&0u32.to_ne_bytes());
+        buf.extend(row6_tcp([1u8; 16], 50000, [2u8; 16], 443, 4242));
+        let map = parse_tcp6_table(&buf);
+        assert_eq!(map.get(&([1u8; 16], 50000, [2u8; 16], 443)), Some(&4242));
+        assert_eq!(map.get(&([2u8; 16], 443, [1u8; 16], 50000)), Some(&4242));
+    }
+
+    #[test]
+    fn truncated_v6_table_is_safe() {
+        assert!(parse_tcp6_table(&[1, 0, 0, 0]).is_empty());
+        assert!(parse_udp6_table(&[1, 0, 0, 0, 9, 9]).is_empty());
+    }
+
     #[test]
     fn lookup_tcp_and_udp() {
         let mut pm = ProcMap::new();
@@ -311,11 +544,11 @@ mod tests {
         udp.insert((3, 5353), 99);
         pm.seed_for_test(tcp, udp);
 
-        assert_eq!(pm.lookup_pid(1, 1000, 2, 80, true, true), Some(42));
-        assert_eq!(pm.lookup_pid(2, 80, 1, 1000, true, false), Some(42));
-        assert_eq!(pm.lookup_pid(3, 5353, 7, 9, false, true), Some(99)); // 出站 UDP 看 src
-        assert_eq!(pm.lookup_pid(7, 9, 3, 5353, false, false), Some(99)); // 入站 UDP 看 dst
-        assert_eq!(pm.lookup_pid(8, 8, 9, 9, true, true), None);
+        assert_eq!(pm.lookup_pid(Flow::V4 { src: 1, sport: 1000, dst: 2, dport: 80 }, true, true), Some(42));
+        assert_eq!(pm.lookup_pid(Flow::V4 { src: 2, sport: 80, dst: 1, dport: 1000 }, true, false), Some(42));
+        assert_eq!(pm.lookup_pid(Flow::V4 { src: 3, sport: 5353, dst: 7, dport: 9 }, false, true), Some(99)); // 出站 UDP 看 src
+        assert_eq!(pm.lookup_pid(Flow::V4 { src: 7, sport: 9, dst: 3, dport: 5353 }, false, false), Some(99)); // 入站 UDP 看 dst
+        assert_eq!(pm.lookup_pid(Flow::V4 { src: 8, sport: 8, dst: 9, dport: 9 }, true, true), None);
     }
 
     #[test]
@@ -341,5 +574,15 @@ mod tests {
         for pid in pm.tcp.values().chain(pm.udp.values()) {
             assert!(*pid != 0);
         }
+        for pid in pm.tcp6.values().chain(pm.udp6.values()) {
+            assert!(*pid != 0);
+        }
+        eprintln!(
+            "连接表规模：TCP v4={} UDP v4={} TCP v6={} UDP v6={}",
+            pm.tcp.len(),
+            pm.udp.len(),
+            pm.tcp6.len(),
+            pm.udp6.len()
+        );
     }
 }

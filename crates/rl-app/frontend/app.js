@@ -293,6 +293,7 @@ function bindEvents() {
         target: block.dataset.target,
         key,
         direction: block.dataset.dir,
+        custom: true,
         custom_value: val
       }
     }), 280);

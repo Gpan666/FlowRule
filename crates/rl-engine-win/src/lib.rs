@@ -282,6 +282,105 @@ pub fn parse_tuple(pkt: &[u8]) -> Option<(u32, u16, u32, u16, bool)> {
     Some((src, sport, dst, dport, is_tcp))
 }
 
+/// 解析 IPv6 包的地址/端口。
+///
+/// 固定 40 字节头 + 可能存在的扩展头（跳 hop / 路由 / 目的选项 / 分片）。
+/// 非首片分片没有传输层端口信息，返回 None → 归入「其他流量」。
+fn parse_v6(pkt: &[u8]) -> Option<(proc_map::Flow, bool)> {
+    if pkt.len() < 40 {
+        return None;
+    }
+    let mut next = pkt[6];
+    let mut off = 40usize;
+    let mut is_tcp = false;
+    // 扩展头链最多走 8 层，防止畸形包造成死循环
+    for _ in 0..8 {
+        match next {
+            6 => {
+                is_tcp = true;
+                break;
+            }
+            17 => {
+                is_tcp = false;
+                break;
+            }
+            // hop-by-hop(0) / routing(43) / destination options(60)
+            0 | 43 | 60 => {
+                if off + 2 > pkt.len() {
+                    return None;
+                }
+                let hdr_len = (pkt[off + 1] as usize + 1) * 8;
+                next = pkt[off];
+                off += hdr_len;
+                if off + 4 > pkt.len() {
+                    return None;
+                }
+            }
+            // fragment(44)：首片才有端口
+            44 => {
+                if off + 8 > pkt.len() {
+                    return None;
+                }
+                let frag = u16::from_be_bytes([pkt[off + 2], pkt[off + 3]]);
+                if frag & 0xfff8 != 0 {
+                    return None;
+                }
+                next = pkt[off];
+                off += 8;
+            }
+            _ => return None,
+        }
+    }
+    if off + 4 > pkt.len() {
+        return None;
+    }
+    let mut src = [0u8; 16];
+    src.copy_from_slice(&pkt[8..24]);
+    let mut dst = [0u8; 16];
+    dst.copy_from_slice(&pkt[24..40]);
+    let sport = u16::from_be_bytes([pkt[off], pkt[off + 1]]);
+    let dport = u16::from_be_bytes([pkt[off + 2], pkt[off + 3]]);
+    Some((proc_map::Flow::V6 { src, sport, dst, dport }, is_tcp))
+}
+
+/// 解析包的地址/端口（IPv4 或 IPv6）与传输层协议。
+///
+/// - IPv4：IHL 决定头长，非首片分片没有端口 → None
+/// - IPv6：40 字节定长头 + 扩展头链
+pub fn parse_flow(pkt: &[u8]) -> Option<(proc_map::Flow, bool)> {
+    if pkt.len() < 20 {
+        return None;
+    }
+    let ver = pkt[0] >> 4;
+    if ver == 6 {
+        return parse_v6(pkt);
+    }
+    if ver != 4 {
+        return None;
+    }
+    let ver_ihl = pkt[0];
+    let ihl = ((ver_ihl & 0x0f) as usize) * 4;
+    if ihl < 20 || pkt.len() < ihl + 4 {
+        return None;
+    }
+    let proto = pkt[9];
+    let is_tcp = match proto {
+        6 => true,
+        17 => false,
+        _ => return None,
+    };
+    // 非首片分片（fragment offset != 0）没有传输层头
+    let frag = u16::from_be_bytes([pkt[6], pkt[7]]);
+    if frag & 0x1fff != 0 {
+        return None;
+    }
+    let src = u32::from_ne_bytes([pkt[12], pkt[13], pkt[14], pkt[15]]);
+    let dst = u32::from_ne_bytes([pkt[16], pkt[17], pkt[18], pkt[19]]);
+    let sport = u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]);
+    let dport = u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]);
+    Some((proc_map::Flow::V4 { src, sport, dst, dport }, is_tcp))
+}
+
 /// 判断一个包归属哪个程序 key（找不到就归 OTHER）
 fn classify(
     pm: &proc_map::ProcMap,
@@ -289,12 +388,12 @@ fn classify(
     pkt: &[u8],
     dir: Direction,
 ) -> String {
-    let tup = match parse_tuple(pkt) {
+    let (flow, is_tcp) = match parse_flow(pkt) {
         Some(t) => t,
         None => return OTHER.to_string(),
     };
     let outbound = dir == Direction::Up;
-    pm.lookup_pid(tup.0, tup.1, tup.2, tup.3, tup.4, outbound)
+    pm.lookup_pid(flow, is_tcp, outbound)
         .and_then(|pid| pid_key.get(&(pid, dir)).cloned())
         .unwrap_or_else(|| OTHER.to_string())
 }
@@ -331,9 +430,12 @@ pub struct EngineDiag {
     pub dropped: u64,
     /// 成功识别到具体程序的包数
     pub program_hits: u64,
-    /// 连接表条目数（TCP / UDP）
+    /// 连接表条目数（TCP / UDP），v4 与 v6 分开统计
     pub tcp_entries: usize,
     pub udp_entries: usize,
+    /// IPv6 连接表条目数（程序级限速要靠它才能覆盖 QUIC / HTTP3）
+    pub tcp6_entries: usize,
+    pub udp6_entries: usize,
     /// 当前 PID→程序 映射条目数
     pub pid_rules: usize,
     /// 当前每个生效令牌桶的速率（人类可读），用于确认「到底限的是多少」
@@ -415,6 +517,8 @@ impl WinDivertEngine {
         d.pid_rules = self.pid_key.len();
         d.tcp_entries = self.proc_map.tcp_len();
         d.udp_entries = self.proc_map.udp_len();
+        d.tcp6_entries = self.proc_map.tcp6_len();
+        d.udp6_entries = self.proc_map.udp6_len();
         let mut parts: Vec<String> = self
             .buckets
             .iter()
@@ -608,6 +712,74 @@ mod tests {
         p[20..22].copy_from_slice(&sport.to_be_bytes());
         p[22..24].copy_from_slice(&dport.to_be_bytes());
         p
+    }
+
+    /// 构造一个 IPv6 包（40 字节固定头 + 4 字节伪传输层头）
+    fn ipv6(src: [u8; 16], sport: u16, dst: [u8; 16], dport: u16, proto: u8) -> Vec<u8> {
+        let mut p = vec![0u8; 44];
+        p[0] = 0x60; // version=6
+        p[4..6].copy_from_slice(&44u16.to_be_bytes()); // payload length
+        p[6] = proto; // next header
+        p[8..24].copy_from_slice(&src);
+        p[24..40].copy_from_slice(&dst);
+        p[40..42].copy_from_slice(&sport.to_be_bytes());
+        p[42..44].copy_from_slice(&dport.to_be_bytes());
+        p
+    }
+
+    #[test]
+    fn parses_ipv6_flow() {
+        let src = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let dst = [0x26, 0x06, 0x47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x68, 0x10];
+        let p = ipv6(src, 51000, dst, 443, 6);
+        let (flow, is_tcp) = parse_flow(&p).unwrap();
+        assert!(is_tcp);
+        match flow {
+            proc_map::Flow::V6 { src: s, sport, dst: d, dport } => {
+                assert_eq!(s, src);
+                assert_eq!(d, dst);
+                assert_eq!(sport, 51000);
+                assert_eq!(dport, 443);
+            }
+            _ => panic!("应为 IPv6 流"),
+        }
+    }
+
+    #[test]
+    fn parses_ipv6_with_extension_header() {
+        let mut p = ipv6([0x20, 0x01, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3], 1234,
+            [0x20, 0x01, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6], 443, 6);
+        // 插入一个 8 字节的 hop-by-hop 扩展头（next header = TCP）
+        p[6] = 0; // hop-by-hop
+        let mut ext = vec![0u8; 8];
+        ext[0] = 6; // next header = TCP
+        ext[1] = 0; // length = 0 → 8 字节
+        p.splice(40..40, ext);
+        let (flow, is_tcp) = parse_flow(&p).unwrap();
+        assert!(is_tcp);
+        match flow {
+            proc_map::Flow::V6 { sport, dport, .. } => {
+                assert_eq!(sport, 1234);
+                assert_eq!(dport, 443);
+            }
+            _ => panic!("应为 IPv6 流"),
+        }
+    }
+
+    #[test]
+    fn ipv4_flow_still_parses() {
+        let p = ipv4_tcp([192, 168, 1, 2], 50000, [10, 0, 0, 1], 443, 6);
+        let (flow, is_tcp) = parse_flow(&p).unwrap();
+        assert!(is_tcp);
+        match flow {
+            proc_map::Flow::V4 { src, sport, dst, dport } => {
+                assert_eq!(src, u32::from_ne_bytes([192, 168, 1, 2]));
+                assert_eq!(dst, u32::from_ne_bytes([10, 0, 0, 1]));
+                assert_eq!(sport, 50000);
+                assert_eq!(dport, 443);
+            }
+            _ => panic!("应为 IPv4 流"),
+        }
     }
 
     #[test]

@@ -727,3 +727,62 @@ OK   processId == 4242                layer=2 (FLOW) 才通过
 - 38 → **42 单测全绿**（rl-app 7 + rl-core 22 + rl-engine 13）。
 - `check_filter.py` PASS；`verify_migration.mjs` 端到端 PASS。
 - 本机仍非管理员，**真实降速速率未实测**。
+
+## 16. 「还是老问题」的最终定位：自定义速率被默认挡位吞掉 + IPv6 流量无法归属（2026-11-10 21:40）
+
+用户第三次反馈「还是老问题」，并要求**直接改安装目录 `F:\Program Files\liulv-v0.1.0-win-x64`**。
+前两轮（13/14/15 节）都在配置层打转，本轮改为**从真实安装目录的落盘配置反推**，终于抓到两条实锤。
+
+### 16.1 现场证据（`F:\Program Files\liulv-v0.1.0-win-x64\config\settings.json`）
+```json
+{ "version": 3, "unit": "mb", "master": false,
+  "other": { "down": {"enabled": false, "sel": "p5", "custom": ""}, ... },
+  "rules": [["f:\...\starward.exe", { "down": {"enabled": false, "sel": "p7", "custom": "1"} }]] }
+```
+- 安装目录里的 exe 是 **20:54 的 v3 构建**（v4 迁移修复根本没部署过去）→ 上一轮的修复用户根本没跑到。
+- 挡位表 `PROFILES` 最高只有 **p7 = 5 MB/s**，**根本没有 20MB 的挡位** → 用户必须用自定义输入框。
+- `other.down` 是 `sel: "p5"` = **1 MB/s**；用户报的「只有 1MB」正好等于 p5。
+
+### 16.2 根因 A：自定义输入框里的数值被**默认挡位 p5(1MB/s)** 吞掉
+`set_rule` 里 `custom_value` 只写 `ds.custom = v.clone()`，**从不把 `sel` 切到 `Sel::Custom`**；
+而 `DirState::new()` 的默认 `sel = Profile(5)`（1 MB/s）、`custom = "1"`。
+于是「输入 20」实际生效的是 **p5 = 1 MB/s** —— 精确对应用户那句「我限制 20MB 直接网络就只有 1MB」；
+若那次输入落在「其他流量」卡片上，则整机被压到 1 MB/s —— 对应「对整个电脑的网络限速了」。
+
+**修复**：抽出可单测的 `apply_rule_edit()`：
+- `custom_value` 非空 → 立即 `sel = Sel::Custom` + `enabled = true`（并置 `master = true`）；
+- 输入框被清空 → **保留原速率**（避免误清空导致限速静默失效）；
+- 前端也显式带上 `custom: true`。
+新增 5 个单测锁死语义（输入 20 → 20971520；输入 0 → 不限速；清空 → 保留；挡位 chip 不受影响；输入算「激活」）。
+
+### 16.3 根因 B：IPv6 / QUIC 流量**永远无法归属到程序**
+`parse_tuple` 只认 IPv4 → 所有 IPv6 包（含 HTTP3/QUIC）一律归「其他流量」。
+一旦「其他流量」有桶（遗留 1MB），这些流量全被压到 1MB → 再次表现为「整机被限、只有 1MB」。
+
+**修复**：
+- 新增 IPv6 包头解析（40 字节定长头 + 扩展头链 hop-by-hop/routing/dest-opt/fragment；
+  非首片分片无端口 → 仍归「其他流量」）。
+- 新增 IPv6 连接表支持：
+  - `GetExtendedUdpTable(AF_INET6, UDP6_TABLE_OWNER_PID)` **可用**；
+  - `GetExtendedTcpTable(AF_INET6, …)` **一律返回 Win32 87**（Windows 不支持 AF_INET6 的 TCP 表），
+    所以 IPv6 TCP 暂时无法归属，IPv6 UDP（QUIC/HTTP3）可以。
+- ★ **IPv6 表的真实布局与文档不符**，实测并用 `netstat -ano` 逐条交叉验证（42/42 命中）：
+  - 表头 **8 字节**（dwNumEntries + 4 字节对齐填充），不是文档的 4 字节；
+  - 行步长 **176 字节**，不是 `MIB_UDP6ROW_OWNER_PID` 的 28 字节；
+  - 行内字段仍按文档：`ucLocalAddr[16]` @0、`dwLocalScopeId` @16、`dwLocalPort` @20、`dwOwningPid` @24。
+  - 为避免把某版本布局写死，解析器按候选步长 **自适应探测**，以「PID 是否合理」为自洽判据；
+    自洽率不足 60% 直接放弃 v6 归属（宁可不归属，也不能把流量错记到别的程序上）。
+- 诊断行新增 `v6 a/b`（IPv6 TCP/UDP 连接表条目数）。
+
+### 16.4 顺带修正
+- `Queue` 之外的旧回归：`parse_tuple` 保留给单测，新增 `parse_flow` 统一处理 v4/v6。
+- 删掉未使用的 `TCP6_ROW_SIZE` / `UDP6_ROW_SIZE` 常量（编译器警告）。
+
+### 16.5 验证
+- 54 单测全绿（rl-app 12 + rl-core 22 + rl-engine 20）。
+- `check_filter.py` PASS（所有 filter 仍可在 NETWORK 层编译）。
+- 真实系统连接表冒烟：TCP v4=300 / UDP v4=77 / **UDP v6=35**（PID 与 netstat 一致）。
+- 已把新 exe 部署到 `F:\Program Files\liulv-v0.1.0-win-x64`（旧 exe + 配置备份在
+  `backup/installed-1110-2137/`），启动冒烟通过、配置自动升级到 v4 且用户规则保留。
+- Release v0.1.0 已重新打包上传（2,088,667 字节）。
+- 本机仍非管理员，**真实降速速率未实测**。

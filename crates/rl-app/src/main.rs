@@ -672,9 +672,10 @@ fn backend(shared: Shared, stop: Arc<AtomicBool>) {
                     // 失败也要刷新诊断（否则诊断恒为 0，会误导排查）
                     let d = engine.diag();
                     g.engine_diag = format!(
-                        "句柄 {}/2 · 桶 {} · 收包 {} · 命中限速 {} · 丢弃 {} · 程序识别 {} · 连接表 TCP {}/UDP {}\n生效桶：{}",
+                        "句柄 {}/2 · 桶 {} · 收包 {} · 命中限速 {} · 丢弃 {} · 程序识别 {} · 连接表 TCP {}/UDP {} · v6 {}/{}\n生效桶：{}",
                         d.handles, d.buckets, d.packets, d.limited, d.dropped,
                         d.program_hits, d.tcp_entries, d.udp_entries,
+                        d.tcp6_entries, d.udp6_entries,
                         if d.bucket_desc.is_empty() { "无" } else { &d.bucket_desc }
                     );
                     last_diag_at = Instant::now();
@@ -742,9 +743,10 @@ fn backend(shared: Shared, stop: Arc<AtomicBool>) {
         if w != last_warning || now.duration_since(last_diag_at) >= Duration::from_millis(500) {
             let d = engine.diag();
             let diag_text = format!(
-                "句柄 {}/2 · 桶 {} · 收包 {} · 命中限速 {} · 丢弃 {} · 程序识别 {} · 连接表 TCP {}/UDP {}\n生效桶：{}",
+                "句柄 {}/2 · 桶 {} · 收包 {} · 命中限速 {} · 丢弃 {} · 程序识别 {} · 连接表 TCP {}/UDP {} · v6 {}/{}\n生效桶：{}",
                 d.handles, d.buckets, d.packets, d.limited, d.dropped,
                 d.program_hits, d.tcp_entries, d.udp_entries,
+                        d.tcp6_entries, d.udp6_entries,
                 if d.bucket_desc.is_empty() { "无" } else { &d.bucket_desc }
             );
             // 开了总开关却没有任何桶 = 根本没接管流量，明确提示，避免「点了没效果」
@@ -834,14 +836,55 @@ fn clear_rule(state: State<'_, Shared>, key: String) {
     s.save();
 }
 
+/// 把一次「编辑」应用到某个方向规则上。
+///
+/// ★ 关键语义：用户在自定义输入框里**直接输入数值**，就等于明确要求「按这个数值限速」。
+/// 旧实现只把字符串存进 `custom`，却没有把 `sel` 从默认挡位切到 `Sel::Custom`，
+/// 于是速率仍取默认挡位 p5（= 1 MB/s）——表现就是「我限制 20MB，网络却只有 1MB」。
+/// 现在只要输入框里有非空内容，就切到 Custom 并启用该方向。
+fn apply_rule_edit(rule: &mut RuleState, edit: &RuleEdit) {
+    let ds = if edit.direction == "up" { &mut rule.up } else { &mut rule.down };
+
+    if let Some(v) = edit.enabled {
+        ds.enabled = v;
+    }
+    if let Some(id) = edit.profile_id {
+        ds.sel = Sel::Profile(id);
+        ds.enabled = true; // 选挡位即视为启用该方向
+    }
+    if edit.custom == Some(true) {
+        ds.sel = Sel::Custom;
+        ds.enabled = true;
+    }
+    if let Some(ref v) = edit.custom_value {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            ds.custom = v.clone();
+            // 输入了数值 → 立即按自定义速率生效（原先的 p5 默认挡位在此被替换掉）
+            ds.sel = Sel::Custom;
+            ds.enabled = true;
+        }
+        // 输入框被清空 → 视为「没输入新值」，保留原速率，避免误清空导致限速静默失效
+    }
+}
+
+/// 这次编辑是否意味着「用户想开始限速」（据此自动打开总开关）。
+fn edit_is_activating(edit: &RuleEdit) -> bool {
+    edit.enabled == Some(true)
+        || edit.profile_id.is_some()
+        || edit.custom == Some(true)
+        || edit
+            .custom_value
+            .as_ref()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+}
+
 #[tauri::command]
 fn set_rule(state: State<'_, Shared>, edit: RuleEdit) {
     let s = {
         let Some(mut g) = lock_mutex(&state) else { return };
-        let activating = edit.enabled == Some(true)
-            || edit.profile_id.is_some()
-            || edit.custom == Some(true)
-            || edit.custom_value.is_some();
+        let activating = edit_is_activating(&edit);
 
         {
             let rule: &mut RuleState = match (edit.target.as_str(), edit.key.as_deref()) {
@@ -849,22 +892,7 @@ fn set_rule(state: State<'_, Shared>, edit: RuleEdit) {
                 ("program", Some(k)) => g.rules.entry(k.to_string()).or_insert_with(RuleState::new),
                 _ => return,
             };
-            let ds = if edit.direction == "up" { &mut rule.up } else { &mut rule.down };
-
-            if let Some(v) = edit.enabled {
-                ds.enabled = v;
-            }
-            if let Some(id) = edit.profile_id {
-                ds.sel = Sel::Profile(id);
-                ds.enabled = true; // 选挡位即视为启用该方向
-            }
-            if edit.custom == Some(true) {
-                ds.sel = Sel::Custom;
-                ds.enabled = true;
-            }
-            if let Some(ref v) = edit.custom_value {
-                ds.custom = v.clone();
-            }
+            apply_rule_edit(rule, &edit);
         } // 释放 g 的可变借用
 
         // 用户主动设挡位/开关/自定义速率，意图就是「开始限速」。
@@ -1037,5 +1065,73 @@ mod tests {
         // 程序规则不受影响
         assert_eq!(cfg.rules.len(), 1);
         assert_eq!(cfg.rules[0].down_bps, 20 * 1024 * 1024);
+    }
+
+    fn edit(direction: &str, custom_value: Option<&str>) -> RuleEdit {
+        RuleEdit {
+            target: "program".to_string(),
+            key: Some("c:\\adu.exe".to_string()),
+            direction: direction.to_string(),
+            enabled: None,
+            profile_id: None,
+            custom: None,
+            custom_value: custom_value.map(|s| s.to_string()),
+        }
+    }
+
+    /// ★ 回归：在自定义输入框里输入 20，速率必须真的是 20 MB/s。
+    ///
+    /// 旧实现只把字符串存进 `custom`，不切换 `sel`，于是速率仍取默认挡位
+    /// p5（= 1 MB/s）——用户报「我限制 20MB，网络却只有 1MB」。
+    #[test]
+    fn typed_custom_value_becomes_effective_rate() {
+        let mut rule = RuleState::new(); // 默认 sel = Profile(5) = 1 MB/s
+        apply_rule_edit(&mut rule, &edit("down", Some("20")));
+
+        assert!(matches!(rule.down.sel, Sel::Custom), "输入数值后必须切到 Custom");
+        assert!(rule.down.enabled, "输入数值即视为启用该方向");
+        assert_eq!(
+            rule.down.bytes_per_sec(Unit::Mb),
+            20 * 1024 * 1024,
+            "输入 20（MB 单位）应得到 20971520 字节/秒，而不是默认挡位的 1MB/s"
+        );
+    }
+
+    /// 输入 0 = 不限速（而不是回落到默认挡位 1MB/s）。
+    #[test]
+    fn typed_zero_means_unlimited() {
+        let mut rule = RuleState::new();
+        apply_rule_edit(&mut rule, &edit("down", Some("0")));
+        assert!(matches!(rule.down.sel, Sel::Custom));
+        assert_eq!(rule.down.bytes_per_sec(Unit::Mb), 0, "0 应表示不限速");
+    }
+
+    /// 清空输入框（空字符串）不应把速率打回默认挡位。
+    #[test]
+    fn clearing_input_keeps_current_rate() {
+        let mut rule = RuleState::new();
+        apply_rule_edit(&mut rule, &edit("down", Some("20")));
+        apply_rule_edit(&mut rule, &edit("down", Some("")));
+        assert!(matches!(rule.down.sel, Sel::Custom), "清空不应切回挡位模式");
+        assert_eq!(rule.down.bytes_per_sec(Unit::Mb), 20 * 1024 * 1024);
+    }
+
+    /// 点挡位 chip 仍然按挡位速率生效（不能被自定义逻辑破坏）。
+    #[test]
+    fn profile_chip_still_sets_profile_rate() {
+        let mut rule = RuleState::new();
+        let mut e = edit("down", None);
+        e.profile_id = Some(7); // 5 MB/s
+        apply_rule_edit(&mut rule, &e);
+        assert!(matches!(rule.down.sel, Sel::Profile(7)));
+        assert_eq!(rule.down.bytes_per_sec(Unit::Mb), 5 * 1024 * 1024);
+    }
+
+    /// 输入数值会触发「自动开启总开关」，否则引擎根本不接管流量。
+    #[test]
+    fn typing_a_rate_counts_as_activating() {
+        assert!(edit_is_activating(&edit("down", Some("20"))));
+        assert!(!edit_is_activating(&edit("down", Some(""))));
+        assert!(!edit_is_activating(&edit("down", None)));
     }
 }
