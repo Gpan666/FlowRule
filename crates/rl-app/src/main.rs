@@ -40,7 +40,7 @@ use rl_core::{
     format_bps, profile, program_key, Direction, Engine, LimitConfig, ProcessInfo, ProgramInfo,
     ProgramRule, Rate, Unit,
 };
-use rl_engine_win::{StatKey, StatsMap, WinDivertEngine};
+use rl_engine_win::{EngineDiag, StatKey, StatsMap, WinDivertEngine};
 
 /// 引擎一轮最多处理多少个包。
 ///
@@ -624,6 +624,33 @@ struct RuleEdit {
     custom_value: Option<String>,
 }
 
+/// 引擎诊断行。**这是用户唯一能自证「限速到底有没有接管流量」的地方**，
+/// 所以每一项都必须能独立说明问题出在哪一环：
+///
+/// - `句柄 0/2` → 压根没接管流量（没设规则 / 被总开关暂停）；
+/// - `收包` 不涨 → 流量没进句柄（驱动被拦、filter 失配）；
+/// - `程序识别 0` 且 `收包` 在涨 → 归属识别失效（VPN / 加密代理中转），
+///   对应程序的限速不可能生效，界面会另有警告；
+/// - `丢弃` 在涨 → 限速确实在生效；
+/// - `去重` 在涨 → 同一份流量在多张网卡上出现，已按包去重（避免限两遍）。
+fn diag_text(d: &EngineDiag) -> String {
+    format!(
+        "句柄 {}/2 · 桶 {} · 收包 {} · 命中限速 {} · 丢弃 {} · 程序识别 {} · 去重 {} · 连接表 TCP {}/UDP {} · v6 {}/{}\n生效桶：{}",
+        d.handles,
+        d.buckets,
+        d.packets,
+        d.limited,
+        d.dropped,
+        d.program_hits,
+        d.duplicates,
+        d.tcp_entries,
+        d.udp_entries,
+        d.tcp6_entries,
+        d.udp6_entries,
+        if d.bucket_desc.is_empty() { "无" } else { &d.bucket_desc }
+    )
+}
+
 // ────────────────────────────── 后台线程 ──────────────────────────────
 
 fn backend(shared: Shared, stop: Arc<AtomicBool>) {
@@ -694,14 +721,7 @@ fn backend(shared: Shared, stop: Arc<AtomicBool>) {
                     };
                     last_warning = g.warning.clone();
                     // 失败也要刷新诊断（否则诊断恒为 0，会误导排查）
-                    let d = engine.diag();
-                    g.engine_diag = format!(
-                        "句柄 {}/2 · 桶 {} · 收包 {} · 命中限速 {} · 丢弃 {} · 程序识别 {} · 连接表 TCP {}/UDP {} · v6 {}/{}\n生效桶：{}",
-                        d.handles, d.buckets, d.packets, d.limited, d.dropped,
-                        d.program_hits, d.tcp_entries, d.udp_entries,
-                        d.tcp6_entries, d.udp6_entries,
-                        if d.bucket_desc.is_empty() { "无" } else { &d.bucket_desc }
-                    );
+                    g.engine_diag = diag_text(&engine.diag());
                     last_diag_at = Instant::now();
                     // 失败后不要高频重试打开驱动句柄
                     drop(g);
@@ -746,9 +766,12 @@ fn backend(shared: Shared, stop: Arc<AtomicBool>) {
 
         // 4) 收包 / 令牌桶判定
         match engine.poll(POLL_BATCH) {
-            // 无论本轮有没有包都让出 1ms：管理员下持续有流量时若全速空转，
-            // 后台线程会高频抢 shared 锁，前端 get_snapshot 容易饥饿、界面像假死。
-            Ok(_) => thread::sleep(Duration::from_millis(1)),
+            // 有包：让出 1ms，避免持续有流量时全速空转抢占 shared 锁（界面像假死）。
+            // 没包：睡久一点（2ms）。`poll` 本身不阻塞（取包一律 0 超时），
+            // 空转时靠这里的 sleep 让出 CPU，而不是靠「无限阻塞在 recv 上」——
+            // 那会把 3 秒一次的进程扫描和 100ms 采样一并卡死，
+            // 令牌桶补桶也全靠这条线程的时间轴（卡住 = 统计与限速一起失准）。
+            Ok(n) => thread::sleep(Duration::from_millis(if n == 0 { 2 } else { 1 })),
             Err(e) => {
                 if last_error.as_deref() != Some(e.as_str()) {
                     last_error = Some(e.clone());
@@ -766,13 +789,7 @@ fn backend(shared: Shared, stop: Arc<AtomicBool>) {
         let now = Instant::now();
         if w != last_warning || now.duration_since(last_diag_at) >= Duration::from_millis(500) {
             let d = engine.diag();
-            let diag_text = format!(
-                "句柄 {}/2 · 桶 {} · 收包 {} · 命中限速 {} · 丢弃 {} · 程序识别 {} · 连接表 TCP {}/UDP {} · v6 {}/{}\n生效桶：{}",
-                d.handles, d.buckets, d.packets, d.limited, d.dropped,
-                d.program_hits, d.tcp_entries, d.udp_entries,
-                d.tcp6_entries, d.udp6_entries,
-                if d.bucket_desc.is_empty() { "无" } else { &d.bucket_desc }
-            );
+            let text = diag_text(&d);
             // 开了总开关却没有任何桶 = 根本没接管流量，明确提示，避免「点了没效果」
             // （注意：v2 起「其他流量」默认不限速，所以只点总开关本身不会产生任何桶，
             //  必须选程序或主动设「其他流量」才会接管，这是预期行为，不是 bug）
@@ -783,7 +800,7 @@ fn backend(shared: Shared, stop: Arc<AtomicBool>) {
             };
             if let Some(mut g) = lock_mutex(&shared) {
                 g.warning = w.clone().or(hint);
-                g.engine_diag = diag_text.clone();
+                g.engine_diag = text;
             }
             last_warning = w;
             last_diag_at = now;
