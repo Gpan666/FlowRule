@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "流律",
+  "productName": "FlowRule",
   "version": "0.2.0",
   "identifier": "com.workbuddy.ratelimiter",
   "build": {
@@ -11,7 +11,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "流律",
+        "title": "FlowRule",
         "width": 1180,
         "height": 920,
         "minWidth": 980,

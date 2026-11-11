@@ -33,8 +33,6 @@ const AF_INET: u32 = 2;
 const AF_INET6: u32 = 23;
 /// TCP_TABLE_OWNER_PID_ALL：包含 listener / connections / established，且带 owning PID
 const TCP_TABLE_OWNER_PID_ALL: u32 = 5;
-/// TCP6_TABLE_OWNER_PID_ALL：IPv6 版，行结构带 16 字节地址
-const TCP6_TABLE_OWNER_PID_ALL: u32 = 19;
 /// UDP_TABLE_OWNER_PID
 const UDP_TABLE_OWNER_PID: u32 = 1;
 /// UDP6_TABLE_OWNER_PID
@@ -54,9 +52,9 @@ const UDP_ROW_SIZE: usize = 12;
 ///     dwLocalPort @20, dwOwningPid @24
 /// 该结论已用 `netstat -ano` 的 IPv6 UDP 端点逐条交叉验证（42/42 命中）。
 /// 为了不把某个版本的布局写死，这里按候选步长自适应探测，取自洽率最高者。
-const V6_HEADER_SIZE: usize = TABLE_HEADER_SIZE;
-const UDP6_STRIDE_CANDIDATES: [usize; 5] = [176, 32, 28, 64, 40];
-const TCP6_STRIDE_CANDIDATES: [usize; 4] = [56, 64, 176, 32];
+const V6_HEADER_SIZE: usize = 4;
+const UDP6_STRIDE_CANDIDATES: [usize; 1] = [28];
+const TCP6_STRIDE_CANDIDATES: [usize; 1] = [56];
 /// PID 合理上界（Windows PID 实际远小于此；超过说明布局解错了）
 const PID_SANE_MAX: u32 = 0x100_0000;
 /// IPv4 连接表头 = `DWORD dwNumEntries` + **4 字节对齐填充** + 行数组。
@@ -212,8 +210,10 @@ pub fn parse_udp_table(buf: &[u8]) -> HashMap<UdpKey, u32> {
 
 /// 从 IPv6 版 UDP owner-pid 表解析 (local_addr, local_port) → PID
 ///
-/// 表头固定 8 字节（与 IPv4 表一致）；行步长按候选值自适应探测：
-/// 错的步长会解析出离谱的 PID 或自洽率过低，直接淘汰（见 [`V6_HEADER_SIZE`]）。
+/// 行布局 = `MIB_UDP6ROW_OWNER_PID`（28 字节）：
+/// `ucLocalAddr[16] @0, dwLocalScopeId @16, dwLocalPort @20, dwOwningPid @24`。
+/// **IPv6 表头是 4 字节**（dwNumEntries 后行直接开始，无填充；IPv4 表才是 8）。
+/// 旧代码照搬 IPv4 的 8 字节表头，整体错位 4 字节，IPv6 归属因此全部失效。
 pub fn parse_udp6_table(buf: &[u8]) -> HashMap<UdpKey6, u32> {
     if buf.len() < V6_HEADER_SIZE {
         return HashMap::new();
@@ -228,7 +228,7 @@ pub fn parse_udp6_table(buf: &[u8]) -> HashMap<UdpKey6, u32> {
         let mut score = 0usize;
         for i in 0..n {
             let off = V6_HEADER_SIZE + i * stride;
-            if off + 32 > buf.len() {
+            if off + 28 > buf.len() {
                 break;
             }
             let mut la = [0u8; 16];
@@ -261,9 +261,15 @@ pub fn parse_udp6_table(buf: &[u8]) -> HashMap<UdpKey6, u32> {
 
 /// 从 IPv6 版 TCP owner-pid 表解析双向五元组 → PID
 ///
-/// 注意：Windows 的 `GetExtendedTcpTable` 对 `ulAf = AF_INET6` 一律返回
-/// Win32 87（INVALID_PARAMETER）——IPv6 的 TCP 连接表拿不到 owning PID。
-/// 因此本机 IPv6 TCP 流量仍会落到「其他流量」，IPv6 UDP（QUIC/HTTP3）可以归属。
+/// 行布局 = `MIB_TCP6ROW_OWNER_PID`（56 字节）：
+/// `ucLocalAddr[16] @0, dwLocalScopeId @16, dwLocalPort @20,
+///  ucRemoteAddr[16] @24, dwRemoteScopeId @40, dwRemotePort @44,
+///  dwState @48, dwOwningPid @52`。
+/// **IPv6 表头是 4 字节**（dwNumEntries 后行直接开始；IPv4 表才是 8）。
+/// 此前先后栽在两个坑上：TableClass 常量写错（19 → Win32 87 → 恒空表）、
+/// 表头照搬 IPv4 的 8 字节 → 整体错位 4 字节。表头 4 + 文档布局与
+/// netstat 唯一 PID 锚点（pid@abs56 = 行0@+52、pid@abs504 = 行8@+52）
+/// 完全自洽，与 `windows` crate 0.62 的结构体定义一致。
 pub fn parse_tcp6_table(buf: &[u8]) -> HashMap<TcpKey6, u32> {
     if buf.len() < V6_HEADER_SIZE {
         return HashMap::new();
@@ -284,9 +290,9 @@ pub fn parse_tcp6_table(buf: &[u8]) -> HashMap<TcpKey6, u32> {
             let mut la = [0u8; 16];
             la.copy_from_slice(&buf[off..off + 16]);
             let mut ra = [0u8; 16];
-            ra.copy_from_slice(&buf[off + 20..off + 36]);
-            let lp = mib_port(rd_u32(buf, off + 44));
-            let rp = mib_port(rd_u32(buf, off + 48));
+            ra.copy_from_slice(&buf[off + 24..off + 40]);
+            let lp = mib_port(rd_u32(buf, off + 20));
+            let rp = mib_port(rd_u32(buf, off + 44));
             let pid = rd_u32(buf, off + 52);
             if pid == 0 || pid > PID_SANE_MAX {
                 continue;
@@ -366,8 +372,11 @@ impl ProcMap {
         let udp_buf = read_table(a.udp, AF_INET, UDP_TABLE_OWNER_PID)?;
         self.tcp = parse_tcp_table(&tcp_buf);
         self.udp = parse_udp_table(&udp_buf);
-        // IPv6 表：个别系统可能不支持，失败时降级（IPv6 流量归「其他流量」），不阻断整体
-        let tcp6_buf = read_table(a.tcp, AF_INET6, TCP6_TABLE_OWNER_PID_ALL).unwrap_or_default();
+        // IPv6 表：TCP/UDP 的 TableClass 枚举与地址族无关，直接复用 IPv4 的常量值。
+        // 旧代码对 TCP6 发明了常量 19（TCP_TABLE_CLASS 只有 0..=8），系统返回
+        // Win32 87（INVALID_PARAMETER）→ 表恒为空 → 所有 IPv6 流量（比如
+        // 走 IPv6 CDN 的下载）永远无法归属进程，限速对它们静默失效。
+        let tcp6_buf = read_table(a.tcp, AF_INET6, TCP_TABLE_OWNER_PID_ALL).unwrap_or_default();
         let udp6_buf = read_table(a.udp, AF_INET6, UDP6_TABLE_OWNER_PID).unwrap_or_default();
         self.tcp6 = parse_tcp6_table(&tcp6_buf);
         self.udp6 = parse_udp6_table(&udp6_buf);
@@ -515,30 +524,31 @@ mod tests {
         assert_eq!(mib_port(0x5000), 80);
     }
 
-    /// 构造 UDP6 表行（实测布局：176 字节步长，端口 @24、PID @28）
+    /// 构造 UDP6 表行（文档布局 MIB_UDP6ROW_OWNER_PID：28 字节，lp@20、pid@24）
     fn row6_udp(la: [u8; 16], lp: u16, pid: u32) -> Vec<u8> {
-        let mut v = vec![0u8; 176];
+        let mut v = vec![0u8; 28];
         v[..16].copy_from_slice(&la);
+        v[16..20].copy_from_slice(&0u32.to_ne_bytes()); // dwLocalScopeId
         v[20..24].copy_from_slice(&(lp.swap_bytes() as u32).to_ne_bytes());
         v[24..28].copy_from_slice(&pid.to_ne_bytes());
         v
     }
 
-    /// 构造 TCP6 表行（文档布局 56 字节）
+    /// 构造 TCP6 表行（文档布局 MIB_TCP6ROW_OWNER_PID，56 字节：
+    /// la@0, scope@16, lp@20, ra@24, scope@40, rp@44, state@48, pid@52）
     fn row6_tcp(la: [u8; 16], lp: u16, ra: [u8; 16], rp: u16, pid: u32) -> Vec<u8> {
         let mut v = vec![0u8; 56];
         v[..16].copy_from_slice(&la);
-        v[20..36].copy_from_slice(&ra);
-        v[44..48].copy_from_slice(&(lp.swap_bytes() as u32).to_ne_bytes());
-        v[48..52].copy_from_slice(&(rp.swap_bytes() as u32).to_ne_bytes());
+        v[20..24].copy_from_slice(&(lp.swap_bytes() as u32).to_ne_bytes());
+        v[24..40].copy_from_slice(&ra);
+        v[44..48].copy_from_slice(&(rp.swap_bytes() as u32).to_ne_bytes());
         v[52..56].copy_from_slice(&pid.to_ne_bytes());
         v
     }
 
-    /// UDP6 表：8 字节表头（dwNumEntries + 4 字节填充）+ 176 字节行
+    /// UDP6 表：4 字节表头（dwNumEntries，无填充）+ 28 字节行
     fn udp6_buf(rows: &[([u8; 16], u16, u32)]) -> Vec<u8> {
         let mut buf = (rows.len() as u32).to_ne_bytes().to_vec();
-        buf.extend_from_slice(&0u32.to_ne_bytes()); // 对齐填充
         for (la, lp, pid) in rows {
             buf.extend(row6_udp(*la, *lp, *pid));
         }
@@ -558,9 +568,8 @@ mod tests {
 
     #[test]
     fn udp6_wrong_stride_is_rejected() {
-        // 步长不对 → 解析出的 PID 离谱 → 必须整体放弃（宁可不归属）
+        // PID 离谱 → 自洽率崩 → 必须整体放弃（宁可不归属）
         let mut buf = 1u32.to_ne_bytes().to_vec();
-        buf.extend_from_slice(&0u32.to_ne_bytes());
         let mut row = vec![0u8; 28];
         row[24..28].copy_from_slice(&0x11223344u32.to_ne_bytes()); // 离谱的 PID
         buf.extend(row);
@@ -570,7 +579,6 @@ mod tests {
     #[test]
     fn tcp6_table_is_bidirectional() {
         let mut buf = 1u32.to_ne_bytes().to_vec();
-        buf.extend_from_slice(&0u32.to_ne_bytes());
         buf.extend(row6_tcp([1u8; 16], 50000, [2u8; 16], 443, 4242));
         let map = parse_tcp6_table(&buf);
         assert_eq!(map.get(&([1u8; 16], 50000, [2u8; 16], 443)), Some(&4242));

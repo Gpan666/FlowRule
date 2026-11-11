@@ -1,8 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/rl-core",
-    "crates/rl-engine-win",
+    "crates/rl-engine",
     "crates/rl-app",
 ]
 

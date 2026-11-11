@@ -1,213 +1,145 @@
-# 流律 (liulv)
+# FlowRule (流律)
 
-> 一个 **Windows 进程级网络带宽限速工具**。为每个程序单独设置上 / 下行速率上限，实时观测流量曲线。
-> 后端基于 Rust + [WinDivert](https://www.reqrypt.org/windivert.html) 限速引擎，前端采用 **Tauri 2 + Miuix (HyperOS / MIUI)** 设计语言。
+> 按进程限速的 Windows 网络带宽管理工具。
+> 基于 WinDivert 内核级数据包捕获 + Rust / Tauri 2 桌面应用。
 
-[English](#english) · 许可证：[MIT](#许可证)
+FlowRule 运行在**网络层**(WinDivert network layer),能捕获本机所有进出网络流量,通过五元组流表把每个数据包归属到具体进程,再按进程(或"其他流量"兜底)应用独立的下载/上传速率限制。限速是**内核级**的——不依赖目标程序自身实现,任何程序(Steam、浏览器、下载器、游戏)都无法绕过。
 
----
+界面采用 Miuix 风格玻璃拟态设计:进程表格实时显示每个程序的上下行速率,点击列头可按下载/上传降序排序,点击「限速」即可为该程序设置独立带宽或完全阻断。
 
-## ✨ 功能特性
+## 特性
 
-- **进程级限速**：自动发现运行中的程序（名称 + 多进程），为每个程序单独设置下载 / 上传速率上限
-- **全局总开关**：一键开启 / 暂停限速，暂停后瞬时恢复满速
-- **多种预设挡位**：极慢 / 慢速 / 标准 / 快 / 很快 / 1 兆 / 2 兆 / 5 兆 / 不限，一键切换即时生效
-- **自定义速率**：支持任意数值输入，单位 **KB/s** 与 **MB/s** 可切换，并显示 **Mbps** 参考值消除歧义
-- **双向独立**：可只限下行、只限上行、或双向分别设置
-- **其他流量独立可控**：未被单独限速的流量默认「按原速放行」（不限速）；如需全局限速，可在「其他流量」卡片主动设置
-- **实时观测**：超大数字速率显示 + 近 60 秒平滑面积曲线，肉眼验证是否生效
-- **真实图标**：列表与详情显示程序真实 exe 图标，无图标的程序只显示名称
-- **Miuix 风格界面**：Squircle 大圆角卡片、毛玻璃层次、胶囊开关、分段控件、明暗双主题
+- **按进程限速**:每个程序独立的上行/下行带宽限制,互不影响
+- **进程表格 UI**:实时速率、累计流量、规则状态一目了然;点击「↓ 下载 / ↑ 上传」列头按当前速率降序排列
+- **完全阻断**:一键切断指定程序的全部网络流量(比限速更狠)
+- **其他流量兜底**:除已设规则的程序外,其余流量可统一限速
+- **总开关**:master 开关一键停用所有限速,立即恢复满速(限速规则仍保留)
+- **60 秒实时曲线**:总上行/总下行速率图,KB/MB 单位切换
+- **引擎诊断栏**:收包/转发/丢弃/进程识别率与四张内核 socket 表计数,便于排查
+- **明暗双主题**:跟随系统或手动切换,Miuix 玻璃质感
+- **单实例运行**:重复启动自动聚焦已有窗口
+- **规则持久化**:限速规则、总开关与兜底限制保存在 `%APPDATA%\rl-app\rules.json`,重启软件后自动恢复
 
-## 📸 截图
-
-| 浅色主题 | 深色主题 |
-| --- | --- |
-| ![浅色主题](docs/screenshots/ui-light.png) | ![深色主题](docs/screenshots/ui-dark.png) |
-
-## 🏗️ 架构
+## 架构
 
 ```
-┌──────────────────────────────────────────────────┐
-│  Tauri 2 前端（HTML / CSS / Miuix 设计系统）        │
-│  自绘标题栏 · 卡片布局 · 明暗主题 · 零 npm 依赖       │
-└──────────────────▲─────────────────┬──────────────┘
-                   │ Tauri invoke    │ Tauri events
-┌──────────────────┴─────────────────▼──────────────┐
-│  rl-app（Rust 后端）                                │
-│  共享状态 Arc<Mutex>（带超时加锁）· 单后台线程       │
-│  配置落盘 config/settings.json                     │
-└─────────┬──────────────────────────┬───────────────┘
-          │                          │
-┌─────────▼──────────┐   ┌───────────▼──────────────┐
-│  rl-core            │   │  rl-engine-win            │
-│  令牌桶 · 单位换算   │   │  WinDivert 2.2 全局句柄×2 │
-│  挡位 · 统计采样     │   │  五元组→PID→令牌桶分派     │
-└────────────────────┘   └───────────────────────────┘
+┌─────────────────────────────────────────────┐
+│  FlowRule.exe (Tauri 2)                     │
+│  ┌───────────────────────────────────────┐  │
+│  │  前端 (HTML/CSS/JS, Miuix 风格)        │  │
+│  │  · 进程表格 + 实时曲线 + 限速弹窗       │  │
+│  │  · 220ms 轮询 get_snapshot             │  │
+│  └───────────────────────────────────────┘  │
+│  ┌───────────────────────────────────────┐  │
+│  │  rl-engine (Rust)                     │  │
+│  │  · flow-events:流层事件维护 PID 归属   │  │
+│  │  · engine:网络层捕获 + 令牌桶判定      │  │
+│  │  · drainer:回填令牌、重注入排队报文    │  │
+│  │  · aggregator:1Hz 快照 + 命令 + 持久化 │  │
+│  └───────────────────────────────────────┘  │
+│  ┌───────────────────────────────────────┐  │
+│  │  WinDivert 内核驱动                    │  │
+│  │  · 网络层:捕获 + 重注入所有报文        │  │
+│  │  · 流层:连接建立事件(带 PID)         │  │
+│  └───────────────────────────────────────┘  │
+└─────────────────────────────────────────────┘
 ```
 
-- **rl-core**：纯逻辑，无平台依赖，可单元测试（单位换算、令牌桶、预设挡位、速率统计）
-- **rl-engine-win**：WinDivert 2.2 限速引擎 + `GetExtendedTcpTable/UdpTable` 进程归属映射，
-  用户态截包 → 五元组识别进程 → 分派令牌桶 → 重注入 / 丢弃
-- **rl-app**：Tauri 2 后端（共享状态 + 单后台线程负责引擎 poll / 进程扫描 / 采样）与 Miuix 前端
+四个后端线程通过 `Arc<Shared>` 无锁纪律协作(每线程同时最多持一把锁),数据包路径不经过任何 UI 代码。
 
-## 📁 目录结构
+## 目录结构
 
 ```
-liulv-ratelimiter/
-├─ Cargo.toml                 # workspace
-├─ crates/
-│  ├─ rl-core/                # 纯逻辑：单位 / 令牌桶 / 挡位 / 统计
-│  ├─ rl-engine-win/src/
-│  │  ├─ lib.rs               # 全局句柄 + 五元组分派 + 令牌桶
-│  │  └─ proc_map.rs          # 连接表→PID 映射（iphlpapi.dll）
-│  └─ rl-app/                 # Tauri 2 后端 + Miuix 前端
-│     ├─ frontend/            # index.html / styles.css / app.js（零 npm 依赖）
-│     ├─ icons/               # 应用图标
-│     ├─ capabilities/        # Tauri 权限
-│     └─ src/                 # main.rs + icons.rs + settings.rs
-├─ assets/                    # WinDivert.dll / WinDivert64.sys / WebView2Loader.dll
-├─ tools/                     # check_filter.py / verify_no_freeze.mjs / verify_ui.py 等
-├─ docs/screenshots/          # README 用截图
-├─ PLAN.md                    # 开发规划与决策记录
-└─ README.md
+FlowRule/
+├── crates/
+│   ├── rl-app/          # Tauri 应用:窗口、托盘、命令接口、前端
+│   │   └── frontend/    # 内嵌 HTML/CSS/JS 界面(无 npm 依赖)
+│   └── rl-engine/       # 限速引擎核心
+│       └── src/backend/ # engine / flows / sockets / rules / synthetic
+├── assets/              # WinDivert 驱动与库文件
+├── .cargo/config.toml   # 构建配置(WINDIVERT_PATH)
+└── Cargo.toml           # workspace 根
 ```
 
-## 🔧 构建
+## 构建
 
-### 前置条件
+### 前置要求
 
-- Rust 工具链（本项目使用 `stable-x86_64-pc-windows-gnu`；MSVC 也可）
-- Windows 10 / 11（**需管理员权限**以加载 WinDivert 驱动）
-- WebView2 Runtime（Windows 11 自带；Windows 10 需安装）
-- 本机 Git 凭据管理器（GCM）已登录 GitHub
+- Windows 10/11 x64
+- [Rust 工具链](https://rustup.rs/)(stable)
+- Visual Studio Build Tools(C++ 桌面开发,用于链接)
+- [Tauri 2 依赖](https://tauri.app/start/prerequisites/)(WebView2 运行时,Win11 自带)
+- WinDivert 2.2.2-A 开发文件(`WinDivert.lib` / `WinDivert.dll` / `WinDivert64.sys`),放在任意目录并在 `.cargo/config.toml` 的 `WINDIVERT_PATH` 中指向它
+
+### 编译
 
 ```bash
-# 克隆
-git clone https://github.com/Gpan666/liulv-ratelimiter.git
-cd liulv-ratelimiter
-
-# 构建（GNU 工具链）
-export PATH="$HOME/.cargo/bin:$PATH"
-cargo build --release --workspace
-
-# 运行（需管理员）
-# 构建产物在本机 rl-target/release/rl-app.exe
-# 把 dist/ 下的 WinDivert.dll / WinDivert64.sys / WebView2Loader.dll 与 exe 放同目录
-# 右键「以管理员身份运行」rl-app.exe
+git clone https://github.com/Gpan666/FlowRule.git
+cd FlowRule
+cargo build --release -p rl-app
+# 产物:target/release/FlowRule.exe
 ```
 
-> 注：本项目通过 `.cargo/config.toml` 把编译输出目录重定向到纯英文路径，
-> 因为 GNU 工具链的 `ld` 无法处理含中文的项目目录。
+### 运行
 
-### CNB 自动构建（.cnb.yml）
+把 `target/release/FlowRule.exe` 与 `assets/` 下的 `WinDivert.dll`、`WinDivert64.sys`、`WebView2Loader.dll` 放在同一目录,以**管理员身份**运行。首次启动时 WinDivert 驱动会自动加载(需管理员权限)。
 
-仓库根目录的 `.cnb.yml` 配置了 CNB 云原生构建流水线：
+> 驱动服务残留排查:若启动报「参数错误」,以管理员运行 `sc query windivert` 确认服务状态,必要时 `sc delete windivert` 后重启电脑再试。
 
-| 触发 | 行为 |
-|---|---|
-| PR 合并进 `main`（`pull_request.merged`） | 在 Windows 构建节点编译 exe，打包 zip 作为**提交附件** |
-| 直接推 `main`（`push`） | 同上 |
-| 推送 `v*` Tag（`tag_push`） | 编译 exe，**创建 Release** 并附上 zip |
+## 限速原理
 
-构建走**自托管 Windows 节点**（CNB 公共节点全是 Linux，无法直接产出 Windows exe）：
+1. **捕获**:网络层 WinDivert 句柄(`!loopback` 过滤)捕获本机所有进出报文;捕获与重注入共用同一句柄,避免低优先级句柄丢弃重注入包。
+2. **归属**:流层事件句柄记录每个连接建立时的 PID;引擎按五元组查流表归属报文,查不到时用内核 socket 表快照(每 2s 刷新,含 IPv4/IPv6 的 TCP/UDP 四张表)兜底合并。
+3. **判定**:命中规则则查该程序对应方向的令牌桶;无规则则走「其他流量」兜底限制;总开关关闭时全部直通。
+4. **执行**:令牌不足时报文进入该桶队列,由 drainer 线程每 5ms 回填令牌后重注入;完全阻断则直接丢弃。TCP 靠丢包/延迟自然产生背压,UDP 按队列上限(256 包 / 1MB)丢弃。
+5. **速率统计**:聚合线程每秒按进程汇总字节数,产出快照供 UI 曲线与表格使用。
 
-1. 根组织「tsbyj.666 → 组织设置 → 构建节点」接入一台 Windows 机器，标签至少包含 `windows`
-2. 构建机需准备：Rust（`stable-x86_64-pc-windows-msvc`）、Visual Studio Build Tools
-   （工作负载「使用 C++ 的桌面开发」，提供 `link.exe`）、git
-3. 流水线脚本：`tools/ci/build-win.ps1`（构建打包）、`tools/ci/upload-artifact.ps1`（上传附件）
+令牌桶突发容量为 200ms 速率量(下限 8KB),限速生效后约 0.2~0.5 秒内压到位,稳态按设定速率匀速放行。
 
-> 自托管节点默认不开启 Docker，因此附件上传直接走 CNB OpenAPI，而不是 `cnbcool/attachments` 插件。
-> 脚本会把源码用 `git archive` 导出到 `%TEMP%` 下的纯 ASCII 目录再编译，规避中文路径导致的链接失败。
+## 已知限制
 
-## 🚀 运行
+- IPv6 流量已完整支持(TCP/UDP 归属均正常);仅 IPv6 无状态地址频繁轮换的极端场景下,流表可能短暂未命中,由 socket 表兜底
+- 限速针对本机网卡带宽,局域网内网流量同样会被统计和限制(loopback 除外)
+- 驱动为 WinDivert 官方签名版本,Windows 11 24H2+ 的 HVCI/驱动签名策略变化可能导致加载失败(当前 26H2 实测正常)
 
-1. 确保 `rl-app.exe` 与以下文件**同目录**：
-   - `WinDivert.dll`、`WinDivert64.sys`（限速驱动，MIT 许可，官方签名）
-   - `WebView2Loader.dll`（GNU 工具链下必须随包，否则启动报 `0xC0000135`）
-2. **双击 `rl-app.exe` 即可**：普通启动不会强制弹 UAC。若当前不是管理员，窗口顶部会出现橙色「需要管理员权限」横幅，点击「以管理员身份运行」按钮即可**自提权重启**（用 `ShellExecute runas`）；已是管理员则横幅不显示，直接可用。
-3. 在左侧选择程序 → 右侧设置上 / 下行限速挡位或自定义速率
-   - 预设挡位最高只到 **5 MB/s**；要设更大的值（如 20 MB/s）请点末端的 **「自定义」** 按钮，
-     在出现的输入框里直接输入数字（单位随顶部的 KB/s · MB/s 切换）。
-     输入后**立即按该数值生效**，不会再退回默认挡位。
-4. **点挡位或方向开关即自动开启限速**（无需再手动开总开关）；顶部总开关用于全局暂停。
-   ⚠️ 总开关本身**不会**自动限速任何流量——必须选程序或主动设置「其他流量」才会真正接管。
-5. 未单独限速、且未在「其他流量」里设置的程序，**原速放行、不被限速**
-6. 单位、限速规则、总开关等设置会自动保存（同目录 `config/settings.json`），下次启动恢复
-7. 总览卡片右下方有一行**引擎实时诊断**（句柄数 / 桶数 / 收包 / 命中限速 / 丢弃 /
-   程序识别 / 连接表规模 / 生效桶明细）。若「句柄 0/2」说明未接管流量；「丢弃」计数在涨说明限速正在生效；
-   「生效桶」里若出现 `其他流量 下行 = …`，说明你手动开启了全局限速（会限制**所有**未被单独限速的流量）；
-   诊断行末尾的 `v6 a/b` 是 IPv6 连接表（TCP/UDP）条目数
-8. ⚠️ **从 v0.1.0 升级**：旧版曾自动给「其他流量」套 1 MB/s 默认挡位，导致「单限某个程序却整台电脑被限速」。
-   新版启动时会**自动清除**这个遗留默认值（你手动输入过自定义速率的「其他流量」设置会被保留）。
-   若升级后你确实想全局限速，在「其他流量」卡片重新设置一次即可。
+## CNB 构建与发布
 
-## ⚙️ 限速原理
+本仓库自带 [`.cnb.yml`](.cnb.yml),在 [cnb.cool](https://cnb.cool) 上 import 本仓库后即可:
 
-WinDivert 在网络栈拦截 IP 包，引擎在**用户态**识别包属于哪个程序并分派令牌桶：
+1. **云端构建**:在 `main` 分支 push 时自动触发 Windows Runner 上的 `cargo build --release`,产物 `FlowRule.exe` + WinDivert 运行时打包为 `FlowRule-windows-x64.zip`,以构建附件形式保留(90 天)。
+2. **打 tag 发 Release**:推送形如 `v0.1.0` 的 tag 时,自动构建并创建/更新对应版本的 Release,zip 作为 Release 资产发布。
 
-```
-网卡 → WinDivert 全局句柄(上/下行各 1 个)
-     → 解析 IPv4 / IPv6 + TCP/UDP 五元组
-     → GetExtendedTcpTable/UdpTable 查 owning PID
-     → PID→程序规则→令牌桶 → 放行(reinject) / 丢弃
-```
-
-- **为什么不用 `processId` 过滤**：WinDivert 2.2 的 `WINDIVERT_LAYER_NETWORK` 明确不支持
-  `processId` 字段（`processId` 仅在 FLOW / SOCKET / REFLECT 层可用），带它的表达式会
-  让 `WinDivertOpen` 返回错误 87。因此改用连接表在用户态做归属判定。
-  `tools/check_filter.py` 会用真实 DLL 离线编译校验所有 filter，防止回归。
-- 上 / 下行各一个全局句柄，filter 天然互斥，不存在「多句柄重叠重复注入」问题
-- 超过速率的包被丢弃，TCP 拥塞控制会自动降速（下行限速的「正常机制」）
-- 令牌桶容量 = max(速率 × 100ms, 1 个 MTU)，且补桶只补最近 100ms 的量：
-  空闲再久也不会一次性补满整段空闲的额度，避免「停顿后突发」绕过限速
-- 连接表（`MIB_*TABLE_OWNER_PID`）IPv4 表头是 `dwNumEntries` + 4 字节对齐填充 = 8 字节，
-  行大小 24（TCP）/ 12（UDP）；偏移少读 4 字节填充就会让每条记录整体错位，
-  PID 全部读成 0、所有流量误判成「其他流量」
-- 引擎每轮**按方向排空**驱动队列（预算内、0 超时立即取），不再「两方向各取 1 个包」，
-  否则下行会被上行的零星 ACK 拖慢
-- `not impostor` 排除重注入的包，避免自捕获死循环；连接表每 700ms 刷新一次
-- 限速对象为「程序」（同一 exe 的多进程共用一个带宽预算），跨 Windows 10 / 11 通用
-
-## 📌 已知限制
-
-- 仅支持 Windows（依赖 WinDivert），且需管理员权限加载驱动
-- 只对 **TCP/UDP** 生效（IPv4 + IPv6 均接管）；ICMP 及非首片 IP 分片不走程序归属判定（归入「其他流量」）
-- 程序级归属：IPv4 的 TCP/UDP 全部支持；**IPv6 仅 UDP 可归属**（即 QUIC / HTTP3 可以按程序限速），
-  IPv6 的 TCP 因 Windows `GetExtendedTcpTable` 不支持 `AF_INET6`（恒返回 Win32 87）暂时归入「其他流量」
-- 进程归属依赖系统连接表，连接刚建立 / 已关闭的短暂窗口内可能归入「其他流量」
-- 未做系统托盘、开机自启、安装包（见 `PLAN.md` 里程碑）
-- 高带宽（千兆）下用户态逐包处理 CPU 占用会上升
-
-## 📜 许可证
-
-本项目以 **MIT 许可证** 开源。
-
-- 限速引擎依赖 [WinDivert](https://www.reqrypt.org/windivert.html)（MIT，官方签名驱动）
-- 前端设计语言参考 Xiaomi **Miuix / HyperOS**
-
----
+> 注意:`.cargo/config.toml` 中的 `WINDIVERT_PATH` 为本地开发路径;CNB 云端构建依赖仓库内 `assets/` 目录,如云端构建失败请检查 `.cnb.yml` 中的路径映射。
 
 ## English
 
-**liulv (流律)** is a Windows per-process network bandwidth limiter. It sets separate download/upload speed caps for each running program and shows a live traffic graph. The backend is Rust + [WinDivert](https://www.reqrypt.org/windivert.html); the frontend is **Tauri 2** styled with the **Miuix (HyperOS/MIUI)** design language.
+**FlowRule** is a per-process network bandwidth limiter for Windows, powered by WinDivert kernel-level packet capture and built with Rust + Tauri 2.
 
-### Features
-- Per-process download/upload rate limiting (auto-discovers running programs)
-- Global master on/off switch; instant restore to full speed when paused
-- Preset speed tiers (极慢 → 5 兆) plus custom rates; KB/s ⇄ MB/s with Mbps reference
-- Independent up/down limits; "other traffic" catch-all bucket
-- Big-number live readout + 60-second smooth area chart
-- Real exe icons; Miuix-style cards, glass layers, capsule toggles, light/dark themes
+It captures every inbound/outbound packet at the network layer, attributes each packet to a process via a flow table (plus kernel socket-table snapshots as fallback), and applies independent download/upload speed limits per process — with a global master switch, an "other traffic" fallback limit, full block, live per-process rate table with sortable columns, a 60-second total-rate chart, and an engine diagnostics bar.
 
-### Build & Run
+Rules persist to `%APPDATA%\rl-app\rules.json` and survive restarts.
+
+### Build
+
 ```bash
-git clone https://github.com/Gpan666/liulv-ratelimiter.git
-cd liulv-ratelimiter
-cargo build --release --workspace
-# Run rl-app.exe as Administrator, alongside WinDivert + WebView2Loader DLLs from dist/
+git clone https://github.com/Gpan666/FlowRule.git
+cd FlowRule
+cargo build --release -p rl-app
 ```
 
-Requires Administrator to load the WinDivert driver. Windows only.
+Requires Rust stable, Visual Studio Build Tools (C++ desktop), WinDivert 2.2.2-A dev files (point `WINDIVERT_PATH` in `.cargo/config.toml` at them), and the WebView2 runtime.
 
-Licensed under MIT.
+### Run
+
+Place `FlowRule.exe` together with `WinDivert.dll`, `WinDivert64.sys` and `WebView2Loader.dll`, then run **as administrator**. The WinDivert driver loads automatically on first run.
+
+### How it works
+
+- A single network-layer WinDivert handle captures all non-loopback traffic; capture and re-injection share this handle to avoid priority-related packet loss.
+- A flow-layer handle records connection-establishment events with their PID; the engine maps every packet to a process by its 5-tuple.
+- Per-`(process, direction)` token buckets (200 ms burst) meter the traffic; packets without enough tokens are queued and re-injected by a drainer thread every 5 ms, creating natural TCP backpressure. Blocked processes have packets dropped outright.
+- An aggregator thread emits a 1 Hz snapshot (per-process rates, totals, history) to the UI and persists rule changes.
+
+## License
+
+MIT

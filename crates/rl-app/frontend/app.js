@@ -1,6 +1,7 @@
-/* 限速器 · Miuix 前端
- * 纯渲染层：所有业务状态在 Rust 端，页面每 220ms 拉一次快照，
- * 交互只通过 invoke 下发意图。静态 DOM 骨架不重建，避免输入框丢焦点。
+/* 流律 · Throttle NetLimiter 形态前端
+ * 纯渲染层：所有业务状态在 Rust 引擎端，页面每 220ms 拉一次快照，
+ * 交互只通过 invoke 下发意图（set_rule / clear_rule / set_master /
+ * set_other_limits）。表格行做 keyed 更新，避免重建导致失焦与滚动跳动。
  */
 
 const $ = (s, r = document) => r.querySelector(s);
@@ -10,332 +11,377 @@ const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
 }[c]));
 
-let lastErr = { msg: '', at: 0 };
-function showError(msg) {
-  // 同样的错误 5 秒内只提示一次，避免 get_snapshot 轮询把界面刷满
-  const now = Date.now();
-  if (msg === lastErr.msg && now - lastErr.at < 5000) return;
-  lastErr = { msg, at: now };
-  let el = $('#errToast');
-  if (!el) {
-    el = document.createElement('div');
-    el.id = 'errToast';
-    el.className = 'err-toast';
-    document.body.appendChild(el);
-  }
-  el.textContent = msg;
-  el.hidden = false;
-  clearTimeout(showError.timer);
-  showError.timer = setTimeout(() => { el.hidden = true; }, 4000);
-}
-
 function call(cmd, args = {}) {
   const inv = window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke;
   if (!inv) return Promise.resolve(undefined);
-  return inv(cmd, args).catch((e) => {
-    console.error(`[${cmd}]`, e);
-    showError(`命令 ${cmd} 失败：${e}`);
-  });
+  return inv(cmd, args).catch((e) => console.error(`[${cmd}]`, e));
 }
 
-let S = null;
-const iconStore = {};
+// ── 全局状态 ──
+let unit = localStorage.getItem('rl-unit') || 'kb';       // kb | mb
 let searchText = '';
-let listSig = '';
-let customTimer = null;
-let busy = false;
+let sortKey = null;                                       // null | 'down' | 'up'（点击表头按当前速率降序）
+let snap = null;                                          // 最近一次快照
+const rows = new Map();                                   // exe → 行元素引用
+const iconStore = new Map();                              // exe → base64 png | null
+const hist = { down: [], up: [], lastSec: 0 };            // 60s 总速率环形历史
+let modalCtx = null;                                      // {kind, exe}
 
-// ── 初始化：为每个方向规则块生成固定 chips ──
-function buildBlocks() {
-  $$('.dir-block').forEach((block) => {
-    const chips = $('[data-role="chips"]', block);
-    for (let i = 0; i < 9; i++) {
-      const b = document.createElement('button');
-      b.className = 'chip';
-      b.dataset.role = 'profileChip';
-      b.dataset.profileId = String(i);
-      b.innerHTML = '<span>—</span>';
-      chips.appendChild(b);
-    }
-    const c = document.createElement('button');
-    c.className = 'chip custom-label';
-    c.dataset.role = 'customChip';
-    c.textContent = '自定义';
-    chips.appendChild(c);
-  });
+const KB = 1024, MB = 1024 * 1024;
+const unitFactor = () => (unit === 'mb' ? MB : KB);
+const unitLabel = () => (unit === 'mb' ? 'MB/s' : 'KB/s');
+
+function fmtRate(bps) {
+  if (unit === 'mb') return (bps / MB).toFixed(2);
+  return (bps / KB).toFixed(1);
+}
+function fmtRateText(bps) {
+  if (!bps) return '0';
+  return `${fmtRate(bps)} ${unit === 'mb' ? 'MB' : 'KB'}`;
+}
+function fmtLimit(bps) {
+  if (bps == null) return null;
+  return fmtRateText(bps);
 }
 
-function hueFromName(s) {
-  let h = 0;
-  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
-  return h % 360;
-}
-
-// ── 曲线：Catmull-Rom 转三次贝塞尔，得到 Miuix 那种顺滑的面积图 ──
+// ── 曲线：Catmull-Rom 转三次贝塞尔的平滑面积图 ──
 function smoothPath(vals, w, h, max) {
-  let v = vals.length >= 2 ? vals : (vals.length === 1 ? [0, vals[0]] : [0, 0]);
+  const v = vals.length >= 2 ? vals : [0, 0];
   const pts = v.map((n, i) => [
     (i / (v.length - 1)) * w,
-    h - 8 - (Math.max(0, n) / max) * (h - 20)
+    h - 2 - (Math.max(0, n) / max) * (h - 6),
   ]);
-  let d = `M ${pts[0][0].toFixed(1)},${pts[0][1].toFixed(1)}`;
+  if (pts.length < 2) return '';
+  let d = `M ${pts[0][0].toFixed(2)} ${pts[0][1].toFixed(2)}`;
   for (let i = 0; i < pts.length - 1; i++) {
-    const p0 = pts[Math.max(0, i - 1)], p1 = pts[i];
-    const p2 = pts[i + 1], p3 = pts[Math.min(pts.length - 1, i + 2)];
-    const c1x = p1[0] + (p2[0] - p0[0]) / 6, c1y = p1[1] + (p2[1] - p0[1]) / 6;
-    const c2x = p2[0] - (p3[0] - p1[0]) / 6, c2y = p2[1] - (p3[1] - p1[1]) / 6;
-    d += ` C ${c1x.toFixed(1)},${c1y.toFixed(1)} ${c2x.toFixed(1)},${c2y.toFixed(1)} ${p2[0].toFixed(1)},${p2[1].toFixed(1)}`;
+    const p0 = pts[Math.max(0, i - 1)], p1 = pts[i], p2 = pts[i + 1], p3 = pts[Math.min(pts.length - 1, i + 2)];
+    const c1 = [p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6];
+    const c2 = [p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6];
+    d += ` C ${c1[0].toFixed(2)} ${c1[1].toFixed(2)}, ${c2[0].toFixed(2)} ${c2[1].toFixed(2)}, ${p2[0].toFixed(2)} ${p2[1].toFixed(2)}`;
   }
   return d;
 }
 
-function renderGraph(g) {
-  const empty = !g || g.peak <= 0 || (!g.down.length && !g.up.length);
-  $('#graphEmpty').hidden = !empty;
-  $('#peakText').textContent = empty ? '峰值 —' : `峰值 ${g.peak_text}`;
-  if (empty) {
-    ['#pathDown', '#pathUp', '#fillDown', '#fillUp'].forEach((s) => $(s).setAttribute('d', ''));
+function drawGraph() {
+  const w = 1000, h = 150;
+  const peak = Math.max(64 * KB, ...hist.down, ...hist.up);
+  const dLine = smoothPath(hist.down, w, h, peak);
+  const uLine = smoothPath(hist.up, w, h, peak);
+  $('#pathDown').setAttribute('d', dLine);
+  $('#pathUp').setAttribute('d', uLine);
+  $('#fillDown').setAttribute('d', dLine ? `${dLine} L ${w} ${h} L 0 ${h} Z` : '');
+  $('#fillUp').setAttribute('d', uLine ? `${uLine} L ${w} ${h} L 0 ${h} Z` : '');
+  $('#peakText').textContent = `峰值 ${fmtRateText(peak)}`;
+  $('#graphEmpty').hidden = hist.down.length > 1;
+}
+
+// ── 表格行 ──
+function ruleOf(exe) {
+  return snap && snap.rules ? snap.rules[exe] : null;
+}
+
+function ruleChips(exe, isOther) {
+  let down, up, blocked = false;
+  if (isOther) {
+    down = snap.other_down_bps; up = snap.other_up_bps;
+  } else {
+    const r = ruleOf(exe);
+    if (r) { down = r.down_limit; up = r.up_limit; blocked = r.blocked; }
+  }
+  if (blocked) return `<span class="rule-chip blocked">已阻断</span>`;
+  const d = fmtLimit(down), u = fmtLimit(up);
+  if (d == null && u == null) return `<span class="rule-chip none">未限速</span>`;
+  return (d != null ? `<span class="rule-chip">↓ ${esc(d)}/s</span>` : '') +
+         (u != null ? `<span class="rule-chip up">↑ ${esc(u)}/s</span>` : '');
+}
+
+function ensureRow(exe, name, path, isOther) {
+  let row = rows.get(exe);
+  if (row) return row;
+  const el = document.createElement('div');
+  el.className = 'proc-row' + (isOther ? ' other' : '');
+  el.innerHTML = `
+    <div class="p-app">
+      <div class="app-icon"><img alt="" hidden /></div>
+      <div class="app-text">
+        <div class="p-name">${esc(name)}</div>
+        <div class="p-path">${esc(path || exe)}</div>
+      </div>
+    </div>
+    <div class="p-rate down"><span data-r="down">0</span><small>下行</small></div>
+    <div class="p-rate up"><span data-r="up">0</span><small>上行</small></div>
+    <div class="p-rule" data-r="rule"></div>
+    <div class="p-ops">
+      <button class="row-btn" data-act="limit">限速</button>
+      <button class="row-btn ghost danger" data-act="clear" title="清除限速">✕</button>
+    </div>`;
+  el.querySelector('[data-act="limit"]').addEventListener('click', () => openModal(exe, isOther));
+  el.querySelector('[data-act="clear"]').addEventListener('click', () => clearLimits(exe, isOther));
+  $('#procList').appendChild(el);
+  row = {
+    el,
+    down: el.querySelector('[data-r="down"]'),
+    up: el.querySelector('[data-r="up"]'),
+    rule: el.querySelector('[data-r="rule"]'),
+    icon: el.querySelector('.app-icon img'),
+    iconLoaded: false,
+  };
+  rows.set(exe, row);
+  return row;
+}
+
+function loadIcon(exe, row) {
+  if (row.iconLoaded) return;
+  if (!iconStore.has(exe)) {
+    iconStore.set(exe, null); // 占位防止重复请求
+    call('get_icon', { exePath: exe }).then((b64) => {
+      iconStore.set(exe, b64 || null);
+      const r = rows.get(exe);
+      if (r && b64) { r.icon.src = `data:image/png;base64,${b64}`; r.icon.hidden = false; }
+    });
     return;
   }
-  const max = Math.max(g.peak * 1.12, 1);
-  const dDown = smoothPath(g.down, 1000, 180, max);
-  const dUp = smoothPath(g.up, 1000, 180, max);
-  $('#pathDown').setAttribute('d', dDown);
-  $('#pathUp').setAttribute('d', dUp);
-  $('#fillDown').setAttribute('d', `${dDown} L 1000,180 L 0,180 Z`);
-  $('#fillUp').setAttribute('d', `${dUp} L 1000,180 L 0,180 Z`);
+  const b64 = iconStore.get(exe);
+  if (b64) { row.icon.src = `data:image/png;base64,${b64}`; row.icon.hidden = false; }
+  row.iconLoaded = true;
 }
 
-// ── 方向规则块（静态 DOM，只更新文本与 class） ──
-function renderDirBlock(block, dto) {
-  if (!block || !dto) return;
-  $('[data-role="switch"]', block).classList.toggle('on', dto.enabled);
-  const val = $('[data-role="value"]', block);
-  val.textContent = dto.short;
-  val.classList.toggle('muted', dto.bytes === 0);
-  const explain = $('[data-role="explain"]', block);
-  if (explain) explain.textContent = dto.explain;
+function renderTable() {
+  if (!snap) return;
+  const q = searchText.trim().toLowerCase();
+  const list = snap.processes.filter((p) =>
+    !q || p.name.toLowerCase().includes(q) || p.exe_path.toLowerCase().includes(q) || String(p.pid).includes(q));
 
-  $$('[data-role="profileChip"]', block).forEach((b, i) => {
-    b.classList.toggle('active', dto.sel === `p${i}`);
-  });
-  $('[data-role="customChip"]', block).classList.toggle('active', dto.sel === 'custom');
-  $('[data-role="customRow"]', block).hidden = dto.sel !== 'custom';
-
-  const input = $('[data-role="customInput"]', block);
-  if (document.activeElement !== input && input.value !== dto.custom) input.value = dto.custom;
-  const unit = $('[data-role="unitLabel"]', block);
-  if (unit) unit.textContent = S.unit_label;
-}
-
-function renderList(s) {
-  const needle = searchText.trim().toLowerCase();
-  const items = s.programs.filter((p) => !needle
-    || p.name.toLowerCase().includes(needle)
-    || p.path.toLowerCase().includes(needle)
-    || p.pid_list.some((id) => String(id).includes(needle)));
-
-  const sig = `${needle}|${s.selected}|${items.map((p) =>
-    `${p.key}:${p.pids}:${p.icon ? 1 : 0}:${p.down_text}:${p.up_text}:${p.limited ? 1 : 0}`).join('|')}`;
-  $('#countChip').textContent = s.scanning
-    ? '扫描中…'
-    : `${s.program_count} 个程序 · ${s.process_count} 个进程`;
-  if (sig === listSig) return;
-  listSig = sig;
-
-  const list = $('#programList');
-  const top = list.scrollTop;
-  list.innerHTML = items.length ? items.map((p) => {
-    const sel = p.key === s.selected;
-    if (p.icon) iconStore[p.key] = p.icon;
-    const iconData = p.icon || iconStore[p.key] || null;
-    return `<div class="prow${sel ? ' selected' : ''}" data-key="${esc(p.key)}" title="${esc(p.path)}">
-      <div class="pname${iconData ? '' : ' no-icon'}">
-        ${iconData ? `<img class="picon-img" src="data:image/png;base64,${iconData}" alt="">` : ''}
-        <div class="pmeta"><b>${esc(p.name)}</b><small>${p.pids > 1 ? p.pids + ' 个进程' : '单进程'}</small></div>
-      </div>
-      <span class="rate down${p.down ? ' hot' : ''}">${esc(p.down_text)}</span>
-      <span class="rate up${p.up ? ' hot' : ''}">${esc(p.up_text)}</span>
-      <span class="ptag">${p.limited ? '<span class="badge">限速中</span>' : ''}</span>
-    </div>`;
-  }).join('') : '<div class="empty-list">没有匹配的程序</div>';
-  list.scrollTop = top;
-}
-
-function renderDetail(s) {
-  const has = !!s.detail;
-  $('#detailEmpty').hidden = has;
-  $('#detailBody').hidden = !has;
-  if (!has) return;
-  const d = s.detail;
-  $('#detailName').textContent = d.name;
-  $('#detailPath').textContent = d.path || '无法获取可执行文件路径';
-  $('#detailPath').title = d.path || '';
-  if (d.icon) iconStore[d.key] = d.icon;
-  const iconData = d.icon || iconStore[d.key] || null;
-  const icon = $('#detailIcon');
-  const iconSig = iconData ? `${d.key}:${iconData.length}` : 'none';
-  if (icon.dataset.sig !== iconSig) {
-    icon.dataset.sig = iconSig;
-    if (iconData) {
-      icon.hidden = false;
-      icon.classList.add('has-img');
-      icon.innerHTML = `<img src="data:image/png;base64,${iconData}" alt="">`;
-    } else {
-      icon.hidden = true;
-      icon.classList.remove('has-img');
-      icon.innerHTML = '';
-    }
+  // 表头排序：按当前速率降序；每次渲染都重排，随实时速率动态变化
+  if (sortKey) {
+    list.sort((a, b) => b[sortKey + '_rate'] - a[sortKey + '_rate']);
   }
-  $('#detailDown').textContent = d.down_text;
-  $('#detailUp').textContent = d.up_text;
-  const pids = $('#detailPids');
-  pids.textContent = d.running ? `${d.pids} 个进程 · 运行中` : '当前未运行';
-  pids.classList.toggle('off', !d.running);
-  renderDirBlock($('[data-target="program"][data-dir="down"]'), d.down_rule);
-  renderDirBlock($('[data-target="program"][data-dir="up"]'), d.up_rule);
-}
 
-function render(s) {
-  S = s;
-  $('#downNum').textContent = s.totals.down_num;
-  $('#downUnit').textContent = s.totals.down_unit;
-  $('#upNum').textContent = s.totals.up_num;
-  $('#upUnit').textContent = s.totals.up_unit;
-  $('#masterSwitch').classList.toggle('on', s.master);
-  $('#masterLabel').textContent = s.master ? '限速已开启' : '限速已暂停';
-  $('#unitSeg').dataset.active = s.unit;
-  $$('.seg-item').forEach((b) => b.classList.toggle('active', b.dataset.unit === s.unit));
-
-  $('#statusText').textContent = s.status;
-  $('#statusText').title = s.status;
-  $('#statusPill').classList.toggle('error', s.status.startsWith('引擎错误'));
-  $('#elevateBanner').hidden = s.elevated;
-  const warn = $('#warningPill');
-  warn.hidden = !s.warning;
-  if (s.warning) {
-    warn.textContent = s.warning;
-    warn.title = s.warning;
-    // 长诊断（含 Win32 错误码）换行完整显示，短提示保持胶囊单行
-    warn.classList.toggle('long', s.warning.length > 18);
+  const wanted = list.map((p) => p.exe_path);
+  // 删除已消失的行
+  for (const [exe, row] of rows) {
+    if (exe !== '__other__' && !wanted.includes(exe)) { row.el.remove(); rows.delete(exe); }
   }
-  const diag = $('#engineDiag');
-  diag.hidden = !s.engine_diag;
-  if (s.engine_diag) diag.textContent = s.engine_diag;
-
-  $$('[data-role="profileChip"]').forEach((b, i) => {
-    const p = s.profiles[i % s.profiles.length];
-    if (p) {
-      const span = $('span', b);
-      if (span.textContent !== p.label) span.textContent = p.label;
-      b.title = p.explain;
+  // 进程行：仅在实际需要时移动/重建 DOM（每 220ms 重排会把鼠标下的节点
+  // 拔出重插，打断 :hover 造成行背景闪烁）
+  const listEl = $('#procList');
+  let prevEl = null;
+  for (const p of list) {
+    const row = ensureRow(p.exe_path, p.name, p.exe_path, false);
+    row.down.textContent = fmtRate(p.down_rate);
+    row.up.textContent = fmtRate(p.up_rate);
+    const chips = ruleChips(p.exe_path, false);
+    if (row.ruleDataset !== chips) { row.rule.innerHTML = chips; row.ruleDataset = chips; }
+    loadIcon(p.exe_path, row);
+    if (row.el.previousElementSibling !== prevEl) {
+      listEl.insertBefore(row.el, prevEl ? prevEl.nextSibling : listEl.firstChild);
     }
-  });
-
-  renderGraph(s.graph);
-  renderList(s);
-  renderDetail(s);
-  renderDirBlock($('[data-target="other"][data-dir="down"]'), s.other.down);
-  renderDirBlock($('[data-target="other"][data-dir="up"]'), s.other.up);
-}
-
-async function tick() {
-  if (busy) return;
-  busy = true;
-  try {
-    const s = await call('get_snapshot');
-    if (s) render(s);
-  } finally {
-    busy = false;
+    prevEl = row.el;
   }
+  // 「其他流量」兜底行固定在最后
+  const other = ensureRow('__other__', '其他流量', '所有未被单独限速的程序', true);
+  other.down.textContent = fmtRate(otherTraffic().down_rate);
+  other.up.textContent = fmtRate(otherTraffic().up_rate);
+  const otherChips = ruleChips(null, true);
+  if (other.ruleDataset !== otherChips) { other.rule.innerHTML = otherChips; other.ruleDataset = otherChips; }
+  if (listEl.lastElementChild !== other.el) listEl.appendChild(other.el);
+
+  $('#countChip').textContent = `${snap.processes.length} 个程序`;
 }
 
-async function act(cmd, args) {
-  await call(cmd, args);
-  await tick();
+function otherTraffic() {
+  // 其他流量速率 = 总速率 − 已有规则进程的速率（仅展示用）
+  let d = snap.total_down_rate, u = snap.total_up_rate;
+  for (const p of snap.processes) {
+    if (snap.rules[p.exe_path]) { d -= p.down_rate; u -= p.up_rate; }
+  }
+  return { down_rate: Math.max(0, d), up_rate: Math.max(0, u) };
 }
 
-// ── 事件 ──
-function bindEvents() {
-  $('#themeBtn').addEventListener('click', () => {
-    const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
-    document.documentElement.dataset.theme = next;
-    try { localStorage.setItem('rl-theme', next); } catch (e) { /* noop */ }
-  });
-
-  $$('.tb-btn.win').forEach((b) => b.addEventListener('click', () => call('win_action', { action: b.dataset.win })));
-
-  $('#masterSwitch').addEventListener('click', () => act('set_master', { on: !S.master }));
-  $('#unitSeg').addEventListener('click', (e) => {
-    const b = e.target.closest('.seg-item');
-    if (b) act('set_unit', { unit: b.dataset.unit });
-  });
-  $('#refreshBtn').addEventListener('click', () => act('refresh', {}));
-  $('#elevateBtn').addEventListener('click', () => call('relaunch_admin'));
-  $('#clearBtn').addEventListener('click', () => {
-    if (S && S.selected) act('clear_rule', { key: S.selected });
-  });
-
-  $('#search').addEventListener('input', (e) => {
-    searchText = e.target.value;
-    if (S) renderList(S);
-  });
-
-  document.addEventListener('input', (e) => {
-    if (!e.target.matches('[data-role="customInput"]')) return;
-    const block = e.target.closest('.dir-block');
-    const key = block.dataset.target === 'program' ? (S && S.selected) : null;
-    if (block.dataset.target === 'program' && !key) return;
-    const val = e.target.value;
-    clearTimeout(customTimer);
-    customTimer = setTimeout(() => act('set_rule', {
-      edit: {
-        target: block.dataset.target,
-        key,
-        direction: block.dataset.dir,
-        custom: true,
-        custom_value: val
-      }
-    }), 280);
-  });
-
-  document.addEventListener('click', (e) => {
-    const chip = e.target.closest('.chip');
-    if (chip) {
-      const block = chip.closest('.dir-block');
-      const key = block.dataset.target === 'program' ? (S && S.selected) : null;
-      if (block.dataset.target === 'program' && !key) return;
-      const edit = { target: block.dataset.target, key, direction: block.dataset.dir };
-      if (chip.dataset.role === 'customChip') edit.custom = true;
-      else edit.profile_id = Number(chip.dataset.profileId);
-      act('set_rule', { edit });
-      return;
-    }
-
-    const sw = e.target.closest('.switch[data-role="switch"]');
-    if (sw) {
-      const block = sw.closest('.dir-block');
-      const key = block.dataset.target === 'program' ? (S && S.selected) : null;
-      if (block.dataset.target === 'program' && !key) return;
-      act('set_rule', {
-        edit: {
-          target: block.dataset.target,
-          key,
-          direction: block.dataset.dir,
-          enabled: !sw.classList.contains('on')
-        }
-      });
-      return;
-    }
-
-    const row = e.target.closest('.prow');
-    if (row) act('select_program', { key: row.dataset.key });
-  });
+function clearLimits(exe, isOther) {
+  if (isOther) {
+    call('set_other_limits', { downBps: null, upBps: null });
+  } else {
+    call('clear_rule', { exe });
+  }
+  // 快照会带回新状态；本地先乐观刷新一次
+  setTimeout(poll, 120);
 }
 
-// ── 启动 ──
-try { document.documentElement.dataset.theme = localStorage.getItem('rl-theme') || 'light'; } catch (e) { /* noop */ }
-buildBlocks();
-bindEvents();
-tick();
-setInterval(tick, 220);
+// ── 限速弹窗 ──
+function openModal(exe, isOther) {
+  modalCtx = { exe, isOther };
+  let name, path, down, up, blocked = false;
+  if (isOther) {
+    name = '其他流量'; path = '所有未被单独限速的程序';
+    down = snap.other_down_bps; up = snap.other_up_bps;
+  } else {
+    const p = snap.processes.find((x) => x.exe_path === exe);
+    name = p ? p.name : exe; path = exe;
+    const r = ruleOf(exe);
+    down = r ? r.down_limit : null; up = r ? r.up_limit : null; blocked = r ? !!r.blocked : false;
+  }
+  $('#modalTitle').textContent = name;
+  $('#modalPath').textContent = path;
+  $('#blockRow').hidden = isOther;
+  setSwitch($('#blockSwitch'), blocked);
+  fillLimitInput($('#modalDown'), down);
+  fillLimitInput($('#modalUp'), up);
+  $('#modalDownUnit').textContent = unitLabel();
+  $('#modalUpUnit').textContent = unitLabel();
+  $('#modalMask').hidden = false;
+  $('#modalDown').focus();
+}
+
+function fillLimitInput(input, bps) {
+  input.value = bps == null ? '' : String(+(bps / unitFactor()).toFixed(unit === 'mb' ? 2 : 1));
+}
+
+function setSwitch(el, on) { el.classList.toggle('on', !!on); el.setAttribute('aria-checked', on ? 'true' : 'false'); }
+
+function parseLimitInput(input) {
+  const s = input.value.trim();
+  if (s === '') return null;                 // 不限
+  const v = parseFloat(s);
+  if (!isFinite(v) || v < 0) return null;
+  return Math.round(v * unitFactor());       // 0 → Some(0) = 阻断该方向
+}
+
+function saveModal() {
+  if (!modalCtx) return closeModal();
+  const down = parseLimitInput($('#modalDown'));
+  const up = parseLimitInput($('#modalUp'));
+  if (modalCtx.isOther) {
+    call('set_other_limits', { downBps: down, upBps: up });
+  } else {
+    call('set_rule', { rule: {
+      exe_path: modalCtx.exe,
+      down_limit: down,
+      up_limit: up,
+      blocked: $('#blockSwitch').classList.contains('on'),
+      disabled: false,
+    } });
+  }
+  closeModal();
+  setTimeout(poll, 120);
+}
+
+function closeModal() {
+  modalCtx = null;
+  $('#modalMask').hidden = true;
+}
+
+// ── 轮询 ──
+async function poll() {
+  const dto = await call('get_snapshot');
+  if (!dto) return;
+  snap = dto;
+
+  // 大数字 + 单位
+  $('#downNum').textContent = fmtRate(dto.total_down_rate);
+  $('#upNum').textContent = fmtRate(dto.total_up_rate);
+  $('#downUnit').textContent = unitLabel();
+  $('#upUnit').textContent = unitLabel();
+
+  // 总开关
+  setSwitch($('#masterSwitch'), dto.master);
+  $('#masterLabel').textContent = dto.master ? '限速运行中' : '限速已暂停';
+  const pill = $('#statusPill');
+  const st = $('#statusText');
+  if (dto.engine_error) {
+    pill.classList.add('off'); st.textContent = '引擎未运行';
+    $('#engineBanner').hidden = false;
+    $('#engineErrorText').textContent = dto.engine_error;
+  } else if (!dto.master) {
+    pill.classList.add('off'); st.textContent = '限速已暂停（流量直通）';
+  } else {
+    pill.classList.remove('off'); st.textContent = '限速运行中';
+  }
+
+  // 提权横幅
+  $('#elevateBanner').hidden = !!dto.elevated;
+
+  // 每秒采样一次总速率进曲线
+  const sec = Math.floor(Date.now() / 1000);
+  if (sec !== hist.lastSec) {
+    hist.lastSec = sec;
+    hist.down.push(dto.total_down_rate);
+    hist.up.push(dto.total_up_rate);
+    if (hist.down.length > 60) { hist.down.shift(); hist.up.shift(); }
+    drawGraph();
+  }
+
+  renderTable();
+
+  // 诊断栏
+  const g = dto.diagnostics || {};
+  const pct = g.packets_recv ? Math.round((g.attributed / g.packets_recv) * 100) : 0;
+  $('#diagBar').innerHTML =
+    `<b>引擎诊断</b><span>包 <b>${g.packets_recv ?? 0}</b></span>` +
+    `<span>转发 <b>${g.shaped ?? 0}</b></span>` +
+    `<span>丢弃 <b>${g.dropped ?? 0}</b></span>` +
+    `<span>进程识别 <b>${pct}%</b></span>` +
+    `<span>TCP4 <b>${g.tcp4 ?? 0}</b></span><span>UDP4 <b>${g.udp4 ?? 0}</b></span>` +
+    `<span>TCP6 <b>${g.tcp6 ?? 0}</b></span><span>UDP6 <b>${g.udp6 ?? 0}</b></span>`;
+}
+
+// ── 事件绑定 ──
+$('#unitSeg').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-unit]');
+  if (!b) return;
+  unit = b.dataset.unit;
+  localStorage.setItem('rl-unit', unit);
+  $('#unitSeg').dataset.active = unit;
+  $$('#unitSeg .seg-item').forEach((x) => x.classList.toggle('active', x === b));
+  if (snap) { poll(); drawGraph(); }
+});
+$$('#unitSeg .seg-item').forEach((x) => x.classList.toggle('active', x.dataset.unit === unit));
+$('#unitSeg').dataset.active = unit;
+
+$('#masterSwitch').addEventListener('click', () => {
+  const on = !$('#masterSwitch').classList.contains('on');
+  setSwitch($('#masterSwitch'), on); // 乐观更新，快照会校正
+  call('set_master', { on });
+  setTimeout(poll, 150);
+});
+
+$('#search').addEventListener('input', (e) => { searchText = e.target.value; renderTable(); });
+
+// 表头点击排序：下载/上传按当前速率降序；再点同一列取消，恢复默认（总速率）排序
+$$('.proc-head .sortable').forEach((h) => h.addEventListener('click', () => {
+  const key = h.dataset.sort;
+  sortKey = sortKey === key ? null : key;
+  $$('.proc-head .sortable').forEach((x) => x.classList.toggle('active', x.dataset.sort === sortKey));
+  renderTable();
+}));
+
+$('#elevateBtn').addEventListener('click', () => call('relaunch_admin'));
+
+$('#themeBtn').addEventListener('click', () => {
+  const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem('rl-theme', next); } catch (e) {}
+});
+
+$('[data-win="min"]').addEventListener('click', () => call('win_action', { action: 'min' }));
+$('[data-win="max"]').addEventListener('click', () => call('win_action', { action: 'max' }));
+$('[data-win="close"]').addEventListener('click', () => call('win_action', { action: 'close' }));
+
+$('#modalSave').addEventListener('click', saveModal);
+$('#modalCancel').addEventListener('click', closeModal);
+$('#modalClear').addEventListener('click', () => {
+  if (!modalCtx) return;
+  clearLimits(modalCtx.exe, modalCtx.isOther);
+  closeModal();
+});
+$('#blockSwitch').addEventListener('click', () =>
+  setSwitch($('#blockSwitch'), !$('#blockSwitch').classList.contains('on')));
+$('#modalMask').addEventListener('mousedown', (e) => { if (e.target === e.currentTarget) closeModal(); });
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeModal();
+  if (e.key === 'Enter' && !$('#modalMask').hidden) saveModal();
+});
+
+// 启动
+poll();
+setInterval(poll, 220);

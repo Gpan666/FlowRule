@@ -3,12 +3,12 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>流律</title>
+  <title>FlowRule</title>
   <script>try{document.documentElement.dataset.theme=localStorage.getItem('rl-theme')||'light'}catch(e){}</script>
   <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
-  <!-- 弥散背景光斑：Miuix 的壁纸 → 玻璃面板 → 内容卡片 三层结构 -->
+  <!-- 弥散背景光斑：壁纸 → 玻璃面板 → 内容卡片 三层结构 -->
   <div class="ambient" aria-hidden="true">
     <span class="orb orb-a"></span>
     <span class="orb orb-b"></span>
@@ -18,12 +18,22 @@
   <header class="titlebar" data-tauri-drag-region="deep">
     <div class="tb-left">
       <div class="tb-logo" aria-hidden="true">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M12 3v7"/><path d="M12 14v7"/><path d="M5.6 7.6 9.9 12"/><path d="M14.1 12l4.3 4.4"/>
-          <circle cx="12" cy="12" r="2.4" fill="currentColor" stroke="none"/>
+        <svg viewBox="0 0 24 24">
+          <defs>
+            <linearGradient id="logoBlue" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" stop-color="#7CB1FF"/>
+              <stop offset="1" stop-color="#2F6FE0"/>
+            </linearGradient>
+            <linearGradient id="logoOrange" x1="0" y1="1" x2="0" y2="0">
+              <stop offset="0" stop-color="#E8720C"/>
+              <stop offset="1" stop-color="#F9B45C"/>
+            </linearGradient>
+          </defs>
+          <path d="M4.9 3.4 H8.3 V12.2 H10.4 L6.6 20.4 L2.8 12.2 H4.9 Z" fill="url(#logoBlue)" stroke="url(#logoBlue)" stroke-width="1.4" stroke-linejoin="round"/>
+          <path d="M15.7 20.6 H19.1 V11.8 H21.2 L17.4 3.6 L13.6 11.8 H15.7 Z" fill="url(#logoOrange)" stroke="url(#logoOrange)" stroke-width="1.4" stroke-linejoin="round"/>
         </svg>
       </div>
-      <span class="tb-title">流律</span>
+      <span class="tb-title">FlowRule</span>
       <span class="tb-sub">网络带宽管理</span>
     </div>
     <div class="tb-right">
@@ -39,19 +49,35 @@
   </header>
 
   <main class="workspace">
-    <!-- ── 提权提示横幅（未以管理员身份运行时显示）── -->
+    <!-- ── 提权提示横幅 ── -->
     <div class="elevate-banner" id="elevateBanner" hidden>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg>
       <div class="eb-text"><b>需要管理员权限</b><span>限速依赖 WinDivert 内核驱动，请点击右侧按钮以管理员身份重新启动本程序</span></div>
       <button class="eb-btn" id="elevateBtn">以管理员身份运行</button>
     </div>
 
-    <!-- ── 总览 Hero ── -->
+    <!-- ── 引擎故障横幅 ── -->
+    <div class="elevate-banner danger" id="engineBanner" hidden>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v5"/><path d="M12 16h.01"/></svg>
+      <div class="eb-text"><b>引擎未能启动</b><span id="engineErrorText">—</span></div>
+    </div>
+
+    <!-- ── 顶栏：总速率 + 总开关 + 60 秒曲线 ── -->
     <section class="card hero">
       <div class="hero-top">
-        <div>
-          <div class="eyebrow">OVERVIEW · 总览</div>
-          <h1 class="hero-title">流量活动</h1>
+        <div class="hero-stats">
+          <div class="stat">
+            <div class="stat-head"><span class="dot down"></span> 下行 <span class="stat-en">DOWNLOAD</span></div>
+            <div class="big-number"><span id="downNum">0</span><span class="big-unit" id="downUnit">KB/s</span></div>
+          </div>
+          <div class="stat-divider"></div>
+          <div class="stat">
+            <div class="stat-head"><span class="dot up"></span> 上行 <span class="stat-en">UPLOAD</span></div>
+            <div class="big-number"><span id="upNum">0</span><span class="big-unit" id="upUnit">KB/s</span></div>
+          </div>
+          <div class="hero-status">
+            <div class="status-pill" id="statusPill"><span class="pulse"></span><span id="statusText">正在启动引擎…</span></div>
+          </div>
         </div>
         <div class="hero-controls">
           <div class="segmented" id="unitSeg" data-active="kb">
@@ -66,25 +92,8 @@
         </div>
       </div>
 
-      <div class="stat-row">
-        <div class="stat">
-          <div class="stat-head"><span class="dot down"></span> 下行速率 <span class="stat-en">DOWNLOAD</span></div>
-          <div class="big-number"><span id="downNum">0</span><span class="big-unit" id="downUnit">KB/s</span></div>
-        </div>
-        <div class="stat-divider"></div>
-        <div class="stat">
-          <div class="stat-head"><span class="dot up"></span> 上行速率 <span class="stat-en">UPLOAD</span></div>
-          <div class="big-number"><span id="upNum">0</span><span class="big-unit" id="upUnit">KB/s</span></div>
-        </div>
-        <div class="hero-status">
-          <div class="status-pill" id="statusPill"><span class="pulse"></span><span id="statusText">正在启动引擎…</span></div>
-          <div class="warning-pill" id="warningPill" hidden></div>
-          <div class="engine-diag" id="engineDiag" hidden></div>
-        </div>
-      </div>
-
       <div class="graph-wrap">
-        <svg id="graph" viewBox="0 0 1000 180" preserveAspectRatio="none" aria-label="最近 60 秒流量曲线">
+        <svg id="graph" viewBox="0 0 1000 150" preserveAspectRatio="none" aria-label="最近 60 秒总速率曲线">
           <defs>
             <linearGradient id="gradDown" x1="0" y1="0" x2="0" y2="1">
               <stop offset="0%" stop-color="var(--down)" stop-opacity=".34"/>
@@ -96,115 +105,84 @@
             </linearGradient>
           </defs>
           <g class="grid">
-            <!-- Miuix 风格：只留极淡的水平虚线参考 + 一条基线，不要方格 -->
-            <line class="guide" x1="0" y1="45" x2="1000" y2="45"/>
-            <line class="guide" x1="0" y1="90" x2="1000" y2="90"/>
-            <line class="guide" x1="0" y1="135" x2="1000" y2="135"/>
-            <line class="baseline" x1="0" y1="179" x2="1000" y2="179"/>
+            <line class="guide" x1="0" y1="38" x2="1000" y2="38"/>
+            <line class="guide" x1="0" y1="75" x2="1000" y2="75"/>
+            <line class="guide" x1="0" y1="113" x2="1000" y2="113"/>
+            <line class="baseline" x1="0" y1="149" x2="1000" y2="149"/>
           </g>
           <path id="fillUp" fill="url(#gradUp)" d=""/>
           <path id="fillDown" fill="url(#gradDown)" d=""/>
           <path id="pathUp" fill="none" stroke="var(--up)" stroke-width="2" vector-effect="non-scaling-stroke" stroke-linecap="round" d=""/>
           <path id="pathDown" fill="none" stroke="var(--down)" stroke-width="2.2" vector-effect="non-scaling-stroke" stroke-linecap="round" d=""/>
         </svg>
-        <div class="graph-empty" id="graphEmpty">开启总开关并设置限速后，这里会显示最近 60 秒的速率曲线</div>
+        <div class="graph-empty" id="graphEmpty">正在采集流量数据…</div>
         <div class="graph-foot"><span class="legend"><i class="dot down"></i>下行</span><span class="legend"><i class="dot up"></i>上行</span><span class="peak" id="peakText">峰值 —</span></div>
       </div>
     </section>
 
-    <div class="columns">
-      <!-- ── 程序列表 ── -->
-      <section class="card programs-card">
-        <div class="card-head">
-          <div><div class="eyebrow">APPLICATIONS</div><h2>运行中的程序</h2></div>
-          <span class="count-chip" id="countChip">扫描中…</span>
-        </div>
-        <div class="search-row">
+    <!-- ── 进程表：NetLimiter 形态 ── -->
+    <section class="card table-card">
+      <div class="card-head">
+        <div><div class="eyebrow">APPLICATIONS</div><h2>运行中的程序</h2></div>
+        <div class="table-tools">
           <div class="search-box">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="10.8" cy="10.8" r="6.2"/><path d="M15.4 15.4 20 20"/></svg>
-            <input id="search" type="text" placeholder="搜索程序 / 路径 / PID" autocomplete="off" spellcheck="false" />
+            <input id="search" type="text" placeholder="搜索程序" autocomplete="off" spellcheck="false" />
           </div>
-          <button class="icon-btn" id="refreshBtn" title="立即刷新进程" aria-label="立即刷新进程">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-2.3 6"/><path d="M20 5v6h-6"/></svg>
-          </button>
+          <span class="count-chip" id="countChip">—</span>
         </div>
-        <div class="list-head"><span>程序</span><span>↓ 下行</span><span>↑ 上行</span><span></span></div>
-        <div class="program-list" id="programList"></div>
-      </section>
+      </div>
 
-      <div class="right-col">
-        <!-- ── 选中程序规则 ── -->
-        <section class="card detail-card">
-          <div class="detail-empty" id="detailEmpty">
-            <div class="empty-icon">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5.5h16v11H4z"/><path d="M4 9.5h16"/><path d="M8 13.5h8"/></svg>
-            </div>
-            <p>从左侧选择一个程序</p>
-            <span>为它单独设置上行 / 下行带宽</span>
-          </div>
+      <div class="proc-head">
+        <span>程序</span><span class="num sortable" data-sort="down" title="点击按当前下载速率降序">↓ 下载</span><span class="num sortable" data-sort="up" title="点击按当前上传速率降序">↑ 上传</span><span>限速状态</span><span class="ops">操作</span>
+      </div>
+      <div class="proc-list" id="procList"></div>
 
-          <div class="detail-body" id="detailBody" hidden>
-            <div class="card-head detail-head">
-              <div class="app-meta">
-                <div class="app-icon" id="detailIcon" hidden></div>
-                <div class="app-text"><h2 id="detailName">—</h2><div class="path" id="detailPath">—</div></div>
-              </div>
-              <button class="text-btn danger" id="clearBtn">清除限速</button>
-            </div>
-            <div class="live-row">
-              <span class="live-chip"><i class="dot down"></i><b id="detailDown">0 KB/s</b><small>下行实时</small></span>
-              <span class="live-chip"><i class="dot up"></i><b id="detailUp">0 KB/s</b><small>上行实时</small></span>
-              <span class="proc-chip" id="detailPids">—</span>
-            </div>
+      <div class="proc-foot">
+        <div class="diag-bar" id="diagBar" title="引擎诊断">引擎待命</div>
+      </div>
+    </section>
+  </main>
 
-            <div class="dir-block" data-target="program" data-dir="down">
-              <div class="dir-head">
-                <div class="dir-title"><span class="dir-icon down">↓</span>下行限速</div>
-                <div class="dir-right"><span class="dir-value" data-role="value">不限速</span><button class="switch small" data-role="switch" role="switch"><span class="knob"></span></button></div>
-              </div>
-              <div class="dir-explain" data-role="explain">不限速：该方向不接管流量</div>
-              <div class="chips" data-role="chips"></div>
-              <div class="custom-row" data-role="customRow" hidden><input type="text" inputmode="decimal" data-role="customInput" placeholder="输入数值" autocomplete="off" spellcheck="false" /><span data-role="unitLabel">KB/s</span></div>
-            </div>
+  <!-- ── 限速设置弹窗 ── -->
+  <div class="modal-mask" id="modalMask" hidden>
+    <div class="modal" role="dialog" aria-modal="true">
+      <div class="modal-head">
+        <div class="app-icon small" id="modalIcon" hidden></div>
+        <div class="app-text">
+          <h3 id="modalTitle">—</h3>
+          <div class="path" id="modalPath">—</div>
+        </div>
+      </div>
 
-            <div class="dir-block" data-target="program" data-dir="up">
-              <div class="dir-head">
-                <div class="dir-title"><span class="dir-icon up">↑</span>上行限速</div>
-                <div class="dir-right"><span class="dir-value" data-role="value">不限速</span><button class="switch small" data-role="switch" role="switch"><span class="knob"></span></button></div>
-              </div>
-              <div class="dir-explain" data-role="explain">不限速：该方向不接管流量</div>
-              <div class="chips" data-role="chips"></div>
-              <div class="custom-row" data-role="customRow" hidden><input type="text" inputmode="decimal" data-role="customInput" placeholder="输入数值" autocomplete="off" spellcheck="false" /><span data-role="unitLabel">KB/s</span></div>
-            </div>
-          </div>
-        </section>
+      <div class="modal-row">
+        <div class="dir-label"><span class="dir-icon down">↓</span>下行限速</div>
+        <div class="limit-input">
+          <input id="modalDown" type="text" inputmode="decimal" placeholder="不限" autocomplete="off" spellcheck="false" />
+          <span class="unit-label" id="modalDownUnit">KB/s</span>
+        </div>
+      </div>
+      <div class="modal-row">
+        <div class="dir-label"><span class="dir-icon up">↑</span>上行限速</div>
+        <div class="limit-input">
+          <input id="modalUp" type="text" inputmode="decimal" placeholder="不限" autocomplete="off" spellcheck="false" />
+          <span class="unit-label" id="modalUpUnit">KB/s</span>
+        </div>
+      </div>
+      <div class="modal-row" id="blockRow">
+        <div class="dir-label"><span class="dir-icon block">⃠</span>完全阻断</div>
+        <button class="switch small" id="blockSwitch" role="switch" aria-label="完全阻断该程序联网"><span class="knob"></span></button>
+      </div>
+      <div class="modal-hint">留空表示不限速；0 表示阻断该方向。修改立即生效并保存。</div>
 
-        <!-- ── 其他流量兜底 ── -->
-        <section class="card other-card">
-          <div class="card-head">
-            <div><div class="eyebrow">FALLBACK</div><h2>其他流量</h2></div>
-            <span class="hint">没有被单独限速的程序</span>
-          </div>
-          <div class="dir-block compact" data-target="other" data-dir="down">
-            <div class="dir-head">
-              <div class="dir-title"><span class="dir-icon down">↓</span>下行限速</div>
-              <div class="dir-right"><span class="dir-value" data-role="value">不限速</span><button class="switch small" data-role="switch" role="switch"><span class="knob"></span></button></div>
-            </div>
-            <div class="chips" data-role="chips"></div>
-            <div class="custom-row" data-role="customRow" hidden><input type="text" inputmode="decimal" data-role="customInput" placeholder="输入数值" autocomplete="off" spellcheck="false" /><span data-role="unitLabel">KB/s</span></div>
-          </div>
-          <div class="dir-block compact" data-target="other" data-dir="up">
-            <div class="dir-head">
-              <div class="dir-title"><span class="dir-icon up">↑</span>上行限速</div>
-              <div class="dir-right"><span class="dir-value" data-role="value">不限速</span><button class="switch small" data-role="switch" role="switch"><span class="knob"></span></button></div>
-            </div>
-            <div class="chips" data-role="chips"></div>
-            <div class="custom-row" data-role="customRow" hidden><input type="text" inputmode="decimal" data-role="customInput" placeholder="输入数值" autocomplete="off" spellcheck="false" /><span data-role="unitLabel">KB/s</span></div>
-          </div>
-        </section>
+      <div class="modal-foot">
+        <button class="text-btn" id="modalClear">清除限速</button>
+        <span class="foot-spacer"></span>
+        <button class="text-btn" id="modalCancel">取消</button>
+        <button class="eb-btn primary" id="modalSave">应用</button>
       </div>
     </div>
-  </main>
+  </div>
 
   <script src="./app.js"></script>
 </body>

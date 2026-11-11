@@ -1,4 +1,4 @@
-[build]
-# GNU 链接器（ld）无法处理含非 ASCII 字符的路径，而本项目目录含中文，
-# 因此把编译输出重定向到一个纯英文路径。换机器时改成任意纯 ASCII 路径即可。
-target-dir = "C:/Users/MOSS/rl-target"
+# windivert-sys 的构建脚本需要 WinDivert.lib / WinDivert.dll / WinDivert64.sys。
+# 这些文件随仓库放在 assets/,这里指向它们的副本(ASCII 路径,避免链接器对中文路径的兼容问题)。
+[env]
+WINDIVERT_PATH = "C:/Users/MOSS/wdlib"
