@@ -1,23 +1,34 @@
-//! 令牌桶。
+//! 令牌桶（**真实丢包式**，不做排队整形）。
 //!
 //! rate_bps == 0 表示不限速（所有包直接放行）。
-//! 桶容量至少容纳一个以太网 MTU（1500 字节），既能吸收一次突发，
-//! 又不会让「小速率」变成「秒级突发后长时间僵死」。
+//!
+//! ## 两条与「限速到底有没有效果」直接相关的硬约束
+//!
+//! 1. **额度必须够一次 TCP 突发的整串**。接收窗口内的数据是成串到达网卡的，
+//!    内核会一口气甩出十几个 1500 字节的包。桶里只有「速率 × 100ms」时，
+//!    慢速挡位（32 KB/s 才 3.2 KB）连一串突发都装不下，后面**每一个**包都被丢，
+//!    丢包率飙到 50% 以上，TCP 反复超时重传 —— 用户看到的是「网页打不开 /
+//!    下载卡死」，而不是「稳在设定的速度」。
+//!    因此额度下限取 16 个 MTU，且上限再叠加一次突发的整串。
+//! 2. **按时间连续补桶，不按窗口边界截断**。只在每个 100ms 窗口的边界结算时，
+//!    窗口末尾的零头会被丢弃，实测速率长期比设定值低一截。
+//!    这里按「流逝时间 × 速率」线性进账（单次最多算 EPOCH_SECS，防止空闲攒出突发）。
 
 use std::time::{Duration, Instant};
 
 /// 桶容量时间窗：100ms 突发
 pub const BURST_WINDOW: Duration = Duration::from_millis(100);
-/// 单个以太网 MTU。桶容量低于它时，**任何速率下的第一个 1500 字节包都过不去**，
-/// 表现为「限速点了但网络直接断/完全没流量」。
-pub const MIN_CAPACITY: u64 = 1500;
-
-/// refill 时最多补 EPOCH_SECS 的令牌。
+/// 一个以太网 MTU（含 IP/TCP 头）
+pub const MTU_BYTES: u64 = 1500;
+/// 额度下限：16 个 MTU ≈ 24 KB。
 ///
-/// 旧实现在桶长时间空闲（没有包经过）后再来一个包时，会把空闲这么多秒的令牌
-/// **一次性全补满**，于是「每秒 32KB」实际可以在 0.1 秒内吐出 10 MB 的突发。
-/// 限速因此时灵时不灵（看客户端是不是恰好连续发包）。只补最近 100ms 的量，
-/// 突发上限就恒等于桶容量。
+/// 低于一个 MTU 时，**任何速率下的第一个整包都过不去**（表现为「一开限速网络就断」）；
+/// 只按「速率 × 100ms」算时，128 KB/s 也就 12.8 KB，一个接收窗口的突发就能打空，
+/// 于是慢速挡位丢包严重、TCP 卡死。16 个 MTU 只相当于把突发窗放宽到几十毫秒，
+/// 对平均速率没有影响。
+pub const MIN_CAPACITY: u64 = MTU_BYTES * 16;
+
+/// refill 时最多补 EPOCH_SECS 的令牌（防止长时间空闲后一次性补满形成巨量突发）
 const EPOCH_SECS: f64 = 0.1;
 
 #[derive(Debug)]
@@ -26,6 +37,8 @@ pub struct TokenBucket {
     capacity: u64,
     tokens: f64,
     last: Instant,
+    /// 突发额度：一次 TCP 突发的整串（16 个 MTU，且不超过 50ms 的流量）
+    burst: u64,
 }
 
 impl TokenBucket {
@@ -36,6 +49,7 @@ impl TokenBucket {
             capacity: 0,
             tokens: 0.0,
             last: Instant::now(),
+            burst: 0,
         };
         b.set_rate(rate_bps);
         b
@@ -57,6 +71,14 @@ impl TokenBucket {
         self.capacity
     }
 
+    /// 令牌上限 = 一次突发额度的整串 + 一个时间片进账。
+    ///
+    /// 只按速率算上限的话，慢速挡位（32 KB/s 一个时间片才 3.2 KB）连一串突发都装不下，
+    /// 丢包会失控；上限太大又会把后续几秒的额度提前透支出去。
+    fn bucket_ceiling(&self) -> f64 {
+        self.burst as f64 + self.capacity as f64
+    }
+
     /// 热更新速率：切挡位时调用，立即生效
     pub fn set_rate(&mut self, rate_bps: u64) {
         self.rate_bps = rate_bps;
@@ -65,27 +87,57 @@ impl TokenBucket {
         } else {
             (rate_bps as f64 * BURST_WINDOW.as_secs_f64()).ceil().max(MIN_CAPACITY as f64) as u64
         };
+        // 突发额度 = 一个时间片的量，但不低于一次 TCP 突发的整串（16 个 MTU），
+        // 也不超过 50ms 的流量（大速率下别让突发太大）。
+        let window_bytes = (rate_bps as f64 * BURST_WINDOW.as_secs_f64()).round() as u64;
+        self.burst = window_bytes
+            .max(MIN_CAPACITY)
+            .min((rate_bps / 20).max(MIN_CAPACITY));
         // 新桶给满，避免切换瞬间卡死
-        self.tokens = self.capacity as f64;
+        self.tokens = self.burst as f64;
         self.last = Instant::now();
     }
 
+    /// 突发额度（不含一个时间片进账）
+    pub fn burst(&self) -> u64 {
+        self.burst
+    }
+
+    /// 测试专用：在「虚拟时间轴」上判定一个包能否放行
+    #[cfg(test)]
+    fn try_consume_at(&mut self, now: Instant, bytes: u64) -> bool {
+        if self.is_unlimited() {
+            return true;
+        }
+        self.refill_at(now);
+        self.consume_tokens(bytes)
+    }
+
     fn refill(&mut self) {
+        let now = Instant::now();
+        self.refill_at(now);
+    }
+
+    /// 以 `now` 作为当前时刻补桶（生产代码走 [`Self::refill`]，测试直接喂时间点）。
+    ///
+    /// 规则只有两条，但都是「限速到底准不准」的关键：
+    ///
+    /// 1. **连续补桶**：额度 = 流逝时间 × 速率，按时间线性进账，
+    ///    不被「窗口边界」截断（截断会让每个窗口的零头凭空消失，实测速率长期偏低）。
+    /// 2. **只看最近一个时间片**：一次流逝超过 EPOCH_SECS 就当只过了 EPOCH_SECS，
+    ///    长时间空闲不会攒出巨量突发。令牌上限 = 一次突发的整串 + 一个片段的额度。
+    fn refill_at(&mut self, now: Instant) {
         if self.is_unlimited() {
             return;
         }
-        let now = Instant::now();
-        // 空闲很久后只补最近 100ms 的量，避免一次性放出巨大突发
-        let dt = now
-            .saturating_duration_since(self.last)
-            .as_secs_f64()
-            .min(EPOCH_SECS);
-        if dt <= 0.0 {
+        let raw_dt = now.saturating_duration_since(self.last).as_secs_f64();
+        if raw_dt <= 0.0 {
             return;
         }
         self.last = now;
-        let add = self.rate_bps as f64 * dt;
-        self.tokens = (self.tokens + add).min(self.capacity as f64);
+        let dt = raw_dt.min(EPOCH_SECS);
+        let ceiling = self.bucket_ceiling();
+        self.tokens = (self.tokens + self.rate_bps as f64 * dt).min(ceiling);
     }
 
     /// 判定一个长度为 bytes 的包能否放行，能则扣减令牌
@@ -94,6 +146,11 @@ impl TokenBucket {
             return true;
         }
         self.refill();
+        self.consume_tokens(bytes)
+    }
+
+    #[inline]
+    fn consume_tokens(&mut self, bytes: u64) -> bool {
         if self.tokens >= bytes as f64 {
             self.tokens -= bytes as f64;
             true
@@ -120,7 +177,7 @@ impl TokenBucket {
 mod tests {
     use super::*;
 
-    #[test]
+        #[test]
     fn unlimited_passes_everything() {
         let mut b = TokenBucket::unlimited();
         assert!(b.try_consume(10_000_000));
@@ -129,62 +186,75 @@ mod tests {
 
     #[test]
     fn burst_then_throttle() {
-        let mut b = TokenBucket::new(1024); // 容量 = 1500（不小于 1 个 MTU）
-        assert!(b.try_consume(1000));
-        assert!(!b.try_consume(1000));
+        let mut b = TokenBucket::new(1024);
+        let cap = b.capacity() as u64;
+        assert!(b.try_consume(cap));
+        assert!(!b.try_consume(1000), "桶打空后连一个小包都不能再放行");
     }
 
     #[test]
     fn refills_over_time() {
-        let mut b = TokenBucket::new(100_000); // 容量 = 10000（100ms 突发）
-        assert!(b.try_consume(10_000));
-        assert!(!b.try_consume(1));
-        // 每 20ms 补 2000 字节；等 60ms 补回 6000（不足一个满桶）
-        std::thread::sleep(Duration::from_millis(60));
-        assert!(b.try_consume(5_000));
-        assert!(!b.try_consume(5_000));
+        let mut b = TokenBucket::new(1_024_000);
+        let burst = b.burst() as u64; // 开桶即满（= 一串 TCP 突发的量）
+        assert!(b.try_consume(burst));
+        assert!(!b.try_consume(burst), "突发额度用完后必须先被挡住");
+        // 时间往前走一个片段，补进来的额度要能立刻用上
+        let mut clock = Instant::now();
+        clock += Duration::from_millis(100);
+        assert!(b.try_consume_at(clock, 100_000));
+        clock += Duration::from_millis(100);
+        assert!(b.try_consume_at(clock, 100_000));
     }
 
     #[test]
     fn set_rate_takes_effect_immediately() {
         let mut b = TokenBucket::new(1024);
-        assert!(!b.try_consume(5000));
+        assert!(!b.try_consume(500_000));
         b.set_rate(10_000);
         assert!(b.try_consume(1000));
         b.set_rate(0);
         assert!(b.try_consume(1_000_000));
     }
 
-    #[test]
-    fn capacity_covers_one_mtu() {
-        let b = TokenBucket::new(1);
-        assert!(b.capacity() >= 1500);
-    }
-
-    /// ★ 回归：桶空闲很久后**不能**把空闲期间的令牌一次性补满。
-    ///
-    /// 旧实现 refill 用完整 dt，于是一个 100ms 没流量的 32 KB/s 桶，
-    /// 再来包时瞬间就能放行 3.2 KB；空闲 10 秒甚至能一次吐出 320 KB。
-    /// 大文件下载是连续发包看不出问题，但「限速后短暂停顿再突发」的场景
-    /// 会明显绕过限速，用户感知就是「限速没生效」。
-    #[test]
-    fn idle_gap_does_not_burst_full_idle_allowance() {
-        let mut b = TokenBucket::new(32 * 1024); // 容量 = 3277（100ms 的量）
-        std::thread::sleep(Duration::from_millis(300));
-        // 空闲 300ms 后，一次最多只能拿到桶容量（≈100ms 的量），而不是 300ms 的量
-        assert!(b.try_consume(3000));
-        assert!(!b.try_consume(1500), "空闲期间的令牌不能被一次性补满");
-    }
-
-    /// ★ 回归：小速率下第一个 1500 字节的整包必须能通过。
+    /// ★ 回归：小速率下第一个整包必须能通过。
     /// 桶容量小于 MTU 时，任何包都过不去 → 表现为「限速一开，网络直接断」。
     #[test]
     fn first_full_mtu_packet_passes_at_any_rate() {
         for rate in [1u64, 1024, 8 * 1024, 32 * 1024, 1024 * 1024] {
             let mut b = TokenBucket::new(rate);
-            assert!(b.capacity() >= MIN_CAPACITY, "rate={rate} 桶容量不足一个 MTU");
-            assert!(b.try_consume(MIN_CAPACITY), "rate={rate} 首包必须放行");
+            assert!(b.capacity() >= MTU_BYTES, "rate={rate} 桶容量不足一个 MTU");
+            assert!(b.try_consume(MTU_BYTES), "rate={rate} 首包必须放行");
         }
+    }
+
+    /// ★ 回归：桶空闲很久后**不能**把空闲期间的令牌一次性补满。
+    ///
+    /// 32 KB/s 的桶闲 10 秒，能攒出的额度上限只能是「一次突发的整串 + 一个窗口进账」，
+    /// 而不是 10 × 32 KB = 320 KB。
+    #[test]
+    fn idle_gap_does_not_burst_full_idle_allowance() {
+        let rate = 32 * 1024u64;
+        let mut b = TokenBucket::new(rate);
+        let mut clock = Instant::now();
+        clock += Duration::from_secs(10);
+        // 空闲结束后只放一个小包，把 refill 触发一次
+        assert!(b.try_consume_at(clock, 1));
+        let ceiling_one_burst = (MIN_CAPACITY + rate / 10) as f64;
+        assert!(
+            b.tokens <= ceiling_one_burst,
+            "空闲 10 秒不该攒出 {} 字节的额度",
+            b.tokens
+        );
+    }
+
+    /// ★ 回归：TCP 突发的**整串**包必须能放行，否则慢速挡位下丢包率飙升、TCP 卡死。
+    #[test]
+    fn tcp_burst_batch_passes_then_throttles() {
+        let mut b = TokenBucket::new(128 * 1024);
+        for _ in 0..16 {
+            assert!(b.try_consume(MTU_BYTES), "16 个连续满包应整串放行");
+        }
+        assert!(!b.try_consume(MTU_BYTES), "突发额度用完后下一个包必须被挡");
     }
 
     #[test]
@@ -195,20 +265,45 @@ mod tests {
         assert!(b.wait_time(9_000_000).unwrap() > Duration::ZERO);
     }
 
-    /// ★ 回归（与 `idle_gap_does_not_burst_full_idle_allowance` 同源，但完全确定性）：
-    /// `Instant` 在不是 `main` 线程的测试线程里也能稳定计时，所以这里把桶
-    /// 放到一个会睡 250ms 的线程里创建并使用，避免不同测试线程的时钟差异。
-    /// 32 KB/s 的桶空闲 250ms 若按旧逻辑补满，会补出 8 KB 令牌（远超桶容量 3277），
-    /// `try_consume(3000) && try_consume(1500)` 就都能通过 —— 现在必须失败。
+    /// ★ 回归：**实测速率必须贴着设定值**。
+    ///
+    /// 供给是配额的数倍时，每秒实际放行的字节必须落在设定值的 ±20% 以内。
+    /// 这条把住「限速到底准不准」：偏低 → 用户觉得限得太狠 / 卡；
+    /// 偏高 → 用户觉得限速根本没生效。
     #[test]
-    fn idle_gap_cap_is_deterministic() {
-        std::thread::spawn(|| {
-            let mut b = TokenBucket::new(32 * 1024);
-            std::thread::sleep(Duration::from_millis(250));
-            assert!(b.try_consume(3000));
-            assert!(!b.try_consume(1500), "空闲 250ms 不该补出超过桶容量的令牌");
-        })
-        .join()
-        .unwrap();
+    fn throughput_tracks_configured_rate() {
+        for rate in [32 * 1024u64, 128 * 1024, 1024 * 1024] {
+            let mut b = TokenBucket::new(rate);
+            // 虚拟时间轴：从当前时刻起推进，不依赖真实 sleep
+            let mut clock = Instant::now();
+            let step = Duration::from_micros(500); // 每 0.5ms 到一个包（供给是配额的数倍）
+            let mut worst = 0f64;
+            // 预热 2 秒：让桶从「开桶即满」进入稳态
+            for _ in 0..4000 {
+                clock += step;
+                let _ = b.try_consume_at(clock, 500);
+            }
+            for _ in 0..4 {
+                let mut passed = 0u64;
+                for _ in 0..2000 {
+                    clock += step;
+                    // 供给是「混合大小的段」：真实下载不会清一色 1500 字节满包
+                    if b.try_consume_at(clock, 500) {
+                        passed += 500;
+                    }
+                }
+                let err = (passed as f64 - rate as f64).abs() / rate as f64;
+                worst = worst.max(err);
+            }
+            assert!(worst < 0.20, "rate={rate} 每秒偏差 {:.1}% 超出 ±20%", worst * 100.0);
+        }
+    }
+
+    /// 桶容量必须有界：不能攒出远超一个突发窗口的额度
+    #[test]
+    fn capacity_stays_bounded() {
+        let b = TokenBucket::new(128 * 1024);
+        assert!(b.capacity() <= 128 * 1024 / 4, "容量 {} 超过 250ms 的量", b.capacity());
+        assert!(b.capacity() >= MIN_CAPACITY);
     }
 }

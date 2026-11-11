@@ -10,7 +10,9 @@
 //! 因此本引擎不再给每个程序开句柄，而是：
 //!
 //! 1. **每方向只开 1 个全局句柄**，filter 用 `Direction::base_filter()`
-//!    （`inbound/outbound and ip and (tcp or udp) and not loopback`，不含 processId）；
+//!    （`inbound/outbound and (ip or ipv6) and (tcp or udp) and not impostor`，
+//!    不含 processId，**也不含任何网卡条件**：句柄必须看到全部流量，
+//!    「同一个包只限一次」由用户态按包内 IP 去重保证，见 [`Dedupe`]）；
 //! 2. 收到包后解析 IPv4 + TCP/UDP 头得到五元组；
 //! 3. 用 [`proc_map::ProcMap`]（GetExtendedTcpTable/UdpTable owner-pid）查到 owning PID；
 //! 4. 按 [`LimitConfig`] 把 PID 映射到程序 key，选出该程序的令牌桶；未匹配则走
@@ -25,7 +27,7 @@ pub mod proc_map;
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr, CString};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use libloading::{Library, Symbol};
 use rl_core::{ByteCounter, Direction, Engine, LimitConfig, TokenBucket};
@@ -49,6 +51,16 @@ const WAIT_OBJECT_0: u32 = 0;
 const WAIT_TIMEOUT: u32 = 258;
 /// 「其他流量」在统计表 / 桶表里的键（真实程序 key 不会是它）
 pub const OTHER: &str = "__other__";
+
+/// 同一个包跨网卡被限多次的去重窗口。
+///
+/// VPN / 代理（Clash TUN、v2rayN、WireGuard…）在本机中转时，同一份数据会在
+/// 虚拟网卡与物理网卡各出现一次，两个方向又各捕获一次 —— 一个字节最多被扣 4 次。
+/// **只能在用户态按包内 IP 判**：filter 里按网卡猜过一次，猜错就是「流量根本不进句柄」。
+///
+/// 阈值取值依据：真实五元组重复出现的间隔至少是一个 TCP 重传超时（≥200ms，通常秒级），
+/// 而跨网卡转发的副本在同一毫秒量级出队，200ms 之内同 IP 的重复一定是同一份流量。
+const DEDUPE_WINDOW: Duration = Duration::from_millis(200);
 
 /// 统计维度：(程序 key 或 OTHER, 方向)
 pub type StatKey = (String, Direction);
@@ -80,7 +92,7 @@ struct Overlapped {
     h_event: Handle,
 }
 
-#[link(name = "kernel32")]
+#[cfg_attr(windows, link(name = "kernel32"))]
 extern "system" {
     fn CreateEventW(
         attributes: *mut std::ffi::c_void,
@@ -313,7 +325,27 @@ impl DirHandle {
         }
 
         match unsafe { WaitForSingleObject(self.h_event, timeout_ms) } {
-            WAIT_TIMEOUT => Ok(None),
+            // 超时后也要问一次 GetOverlappedResult：包可能在「事件置位」与「清除」之间
+            // 到达，事件已被消费掉，此时请求其实已经完成。不查就会一直 pending、
+            // 这个方向从此收不到包（配合「再挂一个请求」更是双输）。
+            WAIT_TIMEOUT => {
+                let mut transferred: u32 = 0;
+                let ok = unsafe {
+                    GetOverlappedResult(self.handle, &mut *self.overlapped, &mut transferred, 0)
+                };
+                if ok == 0 {
+                    let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    // 仍在等（或事件未置位）→ 保持 pending，下一轮继续等
+                    const ERROR_IO_INCOMPLETE: i32 = 996;
+                    if code == ERROR_IO_INCOMPLETE || code == ERROR_IO_PENDING || code == 0 {
+                        return Ok(None);
+                    }
+                    self.recv_pending = false;
+                    return Err(format!("收包完成失败（Win32 错误 {code}）"));
+                }
+                self.recv_pending = false;
+                Ok(Some(transferred as usize))
+            }
             WAIT_OBJECT_0 => {
                 let mut transferred: u32 = 0;
                 let ok = unsafe {
@@ -366,9 +398,14 @@ impl Drop for DirHandle {
             // 先关 WinDivert：会取消挂起的重叠收包，之后再释放事件对象
             unsafe { (api.close)(self.handle) };
         }
+        // 非 Windows（CI 上跑纯逻辑测试）没有 kernel32，关句柄只可能发生在
+        // `WinDivertOpen` 之后，那些代码在测试里跑不到，这里直接跳过。
+        #[cfg(windows)]
         unsafe {
             CloseHandle(self.h_event);
         }
+        #[cfg(not(windows))]
+        let _ = self.h_event;
     }
 }
 
@@ -541,6 +578,72 @@ fn pick_bucket(
     None
 }
 
+/// 跨网卡去重：同一个 IP 包在短时间内的重复副本只算一次。
+///
+/// 键是**包内的识别码**（IPv4 用 IP 头里的 identification 字段，IPv6 用流标签），
+/// 不是五元组 —— VPN 中转会改写端口甚至地址，但同一份内层载荷的识别码是一致的；
+/// 普通直连流量里相邻包的识别码也各不相同，所以不会误判。
+///
+/// 两个方向 **不能共用一个实例**：入站与出站是两份不同数据，
+/// 上行的 ACK 和下行载荷必须各自记账。
+struct Dedupe {
+    seen: HashMap<u32, Instant>,
+    last_gc: Instant,
+}
+
+impl Dedupe {
+    fn new() -> Self {
+        Self { seen: HashMap::new(), last_gc: Instant::now() }
+    }
+
+    /// 返回 true 表示「这个包已经处理过」，调用方应直接放行（不计账、不丢包）。
+    fn is_duplicate(&mut self, pkt: &[u8], now: Instant) -> bool {
+        let Some(id) = dedupe_key(pkt) else {
+            return false;
+        };
+        self.gc(now);
+        match self.seen.get(&id) {
+            Some(t) if now.saturating_duration_since(*t) < DEDUPE_WINDOW => true,
+            _ => {
+                self.seen.insert(id, now);
+                false
+            }
+        }
+    }
+
+    /// 惰性清理过期条目（每 2 个窗口扫一次，成本与流量无关）
+    fn gc(&mut self, now: Instant) {
+        if now.saturating_duration_since(self.last_gc) < DEDUPE_WINDOW * 2 {
+            return;
+        }
+        self.last_gc = now;
+        self.seen.retain(|_, t| now.saturating_duration_since(*t) < DEDUPE_WINDOW);
+    }
+}
+
+/// 取包内识别码：IPv4 = identification（含协议位），IPv6 = 流标签。
+/// 解析不出（分片、畸形包）返回 None → 不做去重，照常限速。
+fn dedupe_key(pkt: &[u8]) -> Option<u32> {
+    if pkt.len() < 20 {
+        return None;
+    }
+    match pkt[0] >> 4 {
+        4 => {
+            let id = u16::from_be_bytes([pkt[4], pkt[5]]) as u32;
+            // 加上协议号：同一 identification 的 TCP/UDP 是两个独立包
+            Some((id << 8) | pkt[9] as u32)
+        }
+        6 => {
+            if pkt.len() < 8 {
+                return None;
+            }
+            // 流标签 = 低 20 位；再加「协议是否首片」无关，直接用它
+            Some(u32::from_be_bytes([pkt[0] & 0x0f, pkt[1], pkt[2], pkt[3]]))
+        }
+        _ => None,
+    }
+}
+
 /// 引擎实时诊断计数（用于定位「点了没效果」到底断在哪一环）
 #[derive(Debug, Default, Clone)]
 pub struct EngineDiag {
@@ -564,6 +667,8 @@ pub struct EngineDiag {
     pub udp6_entries: usize,
     /// 当前 PID→程序 映射条目数
     pub pid_rules: usize,
+    /// 被判定为「同一包的另一张网卡副本」而跳过的包数（跨网卡去重命中）
+    pub duplicates: u64,
     /// 当前每个生效令牌桶的速率（人类可读），用于确认「到底限的是多少」
     pub bucket_desc: String,
 }
@@ -582,6 +687,10 @@ pub struct WinDivertEngine {
     stats: StatsMap,
     config: LimitConfig,
     proc_map: proc_map::ProcMap,
+    /// 每个方向一个：跨网卡 / 双向捕获的重复副本只记一次账
+    dedupe: HashMap<Direction, Dedupe>,
+    /// 已连续多少字节「既没命中限速桶、也没识别出程序」
+    bypass_bytes: u64,
     /// 上一次的「速率签名」（不含 pids）：pids 每 3 秒刷新，只有速率真变了才重建桶
     rate_sig: Option<(Vec<(String, u64, u64)>, u64, u64)>,
     warning: Option<String>,
@@ -616,6 +725,8 @@ impl WinDivertEngine {
             stats: Arc::new(Mutex::new(HashMap::new())),
             config: LimitConfig::unlimited(),
             proc_map: proc_map::ProcMap::new(),
+            dedupe: HashMap::new(),
+            bypass_bytes: 0,
             rate_sig: Some(rate_signature(&LimitConfig::unlimited())),
             warning: None,
         }
@@ -665,6 +776,20 @@ impl WinDivertEngine {
     }
 
     /// 依据配置重建 pid→key、令牌桶，并按需开关全局句柄。
+    /// 当前是否存在**程序级**限速（「其他流量」桶不需要进程归属，不限）
+    fn has_active_rule(&self) -> bool {
+        self.config.rules.iter().any(|r| r.is_active())
+    }
+
+    /// 未识别流量是否已远超被限速的流量。
+    ///
+    /// 判据：连续 256KB 以上「既未命中限速桶、也未识别出程序」。
+    /// 正常场景下即使用户在下载别的程序，未识别量也会被识别成功的流量不断清零，
+    /// 只有「这套归属识别对你的网络完全失效」时才会连续累积到这个量级。
+    fn bypass_ratio_exceeded(&self) -> bool {
+        self.bypass_bytes > 256 * 1024
+    }
+
     fn rebuild(&mut self, config: &LimitConfig) -> Result<(), String> {
         // 期望的 (StatKey, 速率)；同时另建 pid→key 映射
         let mut desired: HashMap<StatKey, u64> = HashMap::new();
@@ -781,14 +906,36 @@ impl Engine for WinDivertEngine {
                     handled += 1;
                     self.diag.packets += 1;
 
+                    // 跨网卡去重：VPN / 代理中转时同一个 IP 包会在多张网卡上各出现一次，
+                    // 只记一次账（副本本身照样放行，绝不因为「重复」去丢包）。
                     let dir = h.dir;
+                    let dup = self
+                        .dedupe
+                        .entry(dir)
+                        .or_insert_with(Dedupe::new)
+                        .is_duplicate(&h.buf[..len], Instant::now());
+                    if dup {
+                        self.diag.duplicates += 1;
+                        if let Err(e) = h.reinject(len) {
+                            first_err.get_or_insert(e);
+                            // 重注入失败不能 continue：否则这个方向下一轮还是同一个包，
+                            // 循环会一直空转（budget 照样扣，但包永远送不出去）
+                            break;
+                        }
+                        continue;
+                    }
                     let key = classify(&self.proc_map, &self.pid_key, &h.buf[..len], dir);
                     if key != OTHER {
                         self.diag.program_hits += 1;
+                        // 归属成功说明这套识别链路是通的，之前的「未生效」提示作废
+                        self.bypass_bytes = 0;
                     }
                     let bucket_key = pick_bucket(&self.buckets, &key, dir);
                     if bucket_key.is_some() {
                         self.diag.limited += 1;
+                    } else if key == OTHER {
+                        // 既没进任何桶、也没认出程序：这一段流量对我们完全隐形
+                        self.bypass_bytes += len as u64;
                     }
                     let pass = match &bucket_key {
                         Some(bk) => self
@@ -804,10 +951,10 @@ impl Engine for WinDivertEngine {
 
                     if pass {
                         if let Err(e) = h.reinject(len) {
-                            // 单个包重注入失败（驱动队列满等）不代表整轮失败，
-                            // 记下第一个错误继续处理，保证其它包不受牵连。
+                            // 单个包重注入失败（驱动队列满等）不代表整轮失败：
+                            // 记下第一个错误就跳出这个方向，让另一个方向照常处理。
                             first_err.get_or_insert(e);
-                            continue;
+                            break;
                         }
                         // 统计用「程序 key」而非实际桶：界面上该程序能看到自己的实时速率，
                         // 即使它走的是「其他流量」兜底。
@@ -839,6 +986,13 @@ impl Engine for WinDivertEngine {
         // 连接表读取失败属于非致命降级：仍能全局限速，但按进程分派不准
         if let Some(e) = self.proc_map.last_error() {
             self.warning = Some(format!("进程识别不可用（{}），按程序限速可能不准确", e));
+        } else if self.has_active_rule() && self.bypass_ratio_exceeded() {
+            // 有程序级限速却几乎全是「归不到任何程序」的流量 → 限速注定不生效。
+            // 只在真正有流量时提示，避免用户没下载时看到吓人的警告。
+            self.warning = Some(
+                "有限速流量未被接管：这些流量的归属识别失败（可能是 VPN / 加密代理中转、                 或系统连接表权限不足），对应程序的限速不会生效。诊断里的「程序识别」                 与「命中限速」长期为 0 即为此症状"
+                    .to_string(),
+            );
         }
 
         match first_err {
@@ -983,6 +1137,86 @@ mod tests {
         for d in Direction::ALL {
             assert!(!d.base_filter().contains("processId"), "{}", d.label());
         }
+    }
+
+    /// ★ 回归：同一个包在两张网卡上的副本只记一次账，且副本本身必须放行。
+    ///
+    /// 用户现场：Clash / TUN 模式下同一份下载走虚拟网卡 + 物理网卡，
+    /// 不区分就会扣两次令牌 → 实测速率正好是设定值的一半。
+    #[test]
+    fn duplicate_copy_is_counted_once() {
+        let mut d = Dedupe::new();
+        let p = ipv4_tcp([1, 2, 3, 4], 5000, [5, 6, 7, 8], 443, 6);
+        let t0 = Instant::now();
+        assert!(!d.is_duplicate(&p, t0), "第一个副本要正常限速");
+        assert!(d.is_duplicate(&p, t0), "同一包的另一张网卡副本必须被识别为重复");
+        assert!(d.is_duplicate(&p, t0 + Duration::from_millis(50)));
+
+        // 过了去重窗口，同样的 identification 视为新包（TCP 重传不能误伤）
+        assert!(!d.is_duplicate(&p, t0 + DEDUPE_WINDOW + Duration::from_millis(1)));
+    }
+
+    /// 不同包不能互相吃掉：identification / 协议不同即为不同包。
+    #[test]
+    fn different_packets_are_not_deduped() {
+        let mut d = Dedupe::new();
+        let t0 = Instant::now();
+        let a = ipv4_tcp([1, 2, 3, 4], 5000, [5, 6, 7, 8], 443, 6);
+        let mut b = a.clone();
+        b[4..6].copy_from_slice(&0x1234u16.to_be_bytes()); // 换个 identification
+        let mut c = a.clone();
+        c[9] = 17; // 同 identification 的 UDP（协议号不同）
+        assert!(!d.is_duplicate(&a, t0));
+        assert!(!d.is_duplicate(&b, t0), "识别码不同的包不能被当成副本");
+        assert!(!d.is_duplicate(&c, t0), "协议不同的包不能被当成副本");
+    }
+
+    /// IPv6 用流标签做键；分片 / 畸形包解析不出键时不做去重（宁可多限不可漏限）。
+    #[test]
+    fn ipv6_dedupe_uses_flow_label() {
+        let mut d = Dedupe::new();
+        let t0 = Instant::now();
+        let mut p = ipv6([1u8; 16], 5000, [2u8; 16], 443, 6);
+        p[0] = 0x60; // 流标签高 4 位
+        p[1] = 0xab;
+        p[2] = 0xcd;
+        p[3] = 0xef;
+        assert!(!d.is_duplicate(&p, t0));
+        assert!(d.is_duplicate(&p, t0));
+        assert!(dedupe_key(&[0u8; 10]).is_none());
+    }
+
+    /// ★ 回归：有程序级限速、但流量全都归不到任何程序时，必须明确告警。
+    ///
+    /// 这就是用户报的「收包数很小、命中限速 0、程序识别 0、丢弃 0，下载却跑满带宽」：
+    /// 归属识别对这套网络失效，限速从设计上就不可能生效，不能静默。
+    #[test]
+    fn warns_when_limited_traffic_is_never_attributed() {
+        let mut e = WinDivertEngine::new();
+        assert!(!e.has_active_rule(), "默认没有任何限速规则");
+
+        e.config = LimitConfig {
+            rules: vec![rl_core::ProgramRule {
+                key: "c:\\starward.exe".into(),
+                pids: vec![4242],
+                down_bps: 5 * 1024 * 1024,
+                up_bps: 0,
+            }],
+            ..Default::default()
+        };
+        assert!(e.has_active_rule());
+
+        // 只有零星未识别流量：不打扰用户
+        e.bypass_bytes = 8 * 1024;
+        assert!(!e.bypass_ratio_exceeded());
+
+        // 未识别流量持续累积：判定为「限速完全没接管」
+        e.bypass_bytes = 512 * 1024;
+        assert!(e.bypass_ratio_exceeded());
+
+        // 一旦有流量成功归属，计数清零、告警作废
+        e.bypass_bytes = 0;
+        assert!(!e.bypass_ratio_exceeded());
     }
 
     #[test]
