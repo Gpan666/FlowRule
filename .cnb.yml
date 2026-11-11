@@ -17,7 +17,8 @@
 #   4. 机器能访问 cnb.cool 与 crates.io
 #
 # ── 产物去向 ────────────────────────────────────────────────────────────────
-#   v* Tag push → 构建 Release 版 exe，打包 zip 创建/更新对应版本的 Release
+#   v* Tag push → 构建 Release 版 exe，打包 zip 创建/更新对应版本的 Release，
+#                  并自动同步同一 zip 到 GitHub 同名 Release（需配置 GITHUB_TOKEN）。
 #
 # 发版流程：改代码 → 合并到 main → 更新 Cargo.toml/tauri.conf.json 版本号 →
 #           git tag vX.Y.Z && git push cnb vX.Y.Z 即自动出 Release。
@@ -45,6 +46,10 @@ v*:
         - name: create release and upload asset
           script: |
             & "$env:CNB_BUILD_WORKSPACE\tools\ci\upload-artifact.ps1" -Mode release
+
+        - name: sync release to github
+          script: |
+            & "$env:CNB_BUILD_WORKSPACE\tools\ci\upload-github.ps1"
 
 # ── 其他事件：不构建 ─────────────────────────────────────────────────────────
 $:
