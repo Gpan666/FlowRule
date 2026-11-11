@@ -60,7 +60,7 @@ FlowRule/
 ├── tools/
 │   ├── ci/              # CNB 流水线脚本(构建/打包/上传 Release)
 │   └── scripts/         # 本地诊断与验证脚本
-├── .cargo/config.toml   # 构建配置
+├── .cargo/config.toml   # cargo 说明(无本机路径依赖)
 └── Cargo.toml           # workspace 根
 ```
 
@@ -72,7 +72,7 @@ FlowRule/
 - [Rust 工具链](https://rustup.rs/)(stable)
 - Visual Studio Build Tools(C++ 桌面开发,用于链接)
 - [Tauri 2 依赖](https://tauri.app/start/prerequisites/)(WebView2 运行时,Win11 自带)
-- WinDivert 2.2.2-A 运行时(`WinDivert.dll` / `WinDivert64.sys`)与 `WebView2Loader.dll`,放到 `assets/` 目录(二进制不入库;CI 构建时脚本会自动从 Release 下载,本地开发手动放置一次即可)
+- 编译期需要 `assets/WinDivert.lib`(windivert-sys 链接用;CI 自动下载,本地开发放置一次即可);运行期需要 `WinDivert.dll` / `WinDivert64.sys` / `WebView2Loader.dll` 与 exe 同目录,详见 `assets/README.md`
 
 ### 编译
 
@@ -127,7 +127,7 @@ cd FlowRule
 cargo build --release -p rl-app
 ```
 
-Requires Rust stable, Visual Studio Build Tools (C++ desktop), WinDivert 2.2.2-A dev files (point `WINDIVERT_PATH` in `.cargo/config.toml` at them), and the WebView2 runtime.
+Requires Rust stable, Visual Studio Build Tools (C++ desktop) and the WebView2 runtime. Building also needs `WinDivert.lib` under `assets/` (CI fetches it automatically; see `assets/README.md`).
 
 ### Run
 

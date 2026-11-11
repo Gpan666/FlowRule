@@ -107,6 +107,16 @@ if ($missing.Count -gt 0) {
     Write-Step '运行时文件已就绪'
 }
 
+# WinDivert.lib：编译期链接 windivert-sys 所需（面向用户的 zip 里没有），
+# 作为独立 Release 附件提供，可用 WINDIVERT_LIB_URL 覆盖来源。
+$libPath = Join-Path $assetsDir 'WinDivert.lib'
+if (-not (Test-Path $libPath)) {
+    $libUrl = if ($env:WINDIVERT_LIB_URL) { $env:WINDIVERT_LIB_URL } else { 'https://github.com/Gpan666/FlowRule/releases/download/v1.0.0/WinDivert.lib' }
+    Write-Step ("缺少 WinDivert.lib，下载：" + $libUrl)
+    Invoke-WebRequest -Uri $libUrl -OutFile $libPath -UseBasicParsing
+    Write-Step 'WinDivert.lib 已就绪'
+}
+
 # 0.3 Rust 工具链
 #     CNB 自托管 runner 常以 LocalSystem 账户运行，%USERPROFILE% 指向
 #     C:\Windows\System32\config\systemprofile，而 Rust 往往装在某个真人用户下

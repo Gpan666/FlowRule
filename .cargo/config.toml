@@ -1,4 +1,13 @@
-# windivert-sys 的构建脚本需要 WinDivert.lib / WinDivert.dll / WinDivert64.sys。
-# 这些文件随仓库放在 assets/,这里指向它们的副本(ASCII 路径,避免链接器对中文路径的兼容问题)。
+# WinDivert 编译期依赖说明
+#
+# windivert-sys 构建时需要 WINDIVERT_PATH 指向包含 WinDivert.lib/.dll/.sys
+# 的目录(链接 import library)。这里用相对路径,不再写死任何本机绝对路径：
+#   - 相对路径以「运行 cargo 时的当前目录」为基准,即仓库根目录
+#   - 文件放在 assets/ 下(二进制不入库)：
+#       * CI 构建：tools/ci/build-win.ps1 自动从 GitHub Release 下载
+#       * 本地开发：手动放置一次,见 assets/README.md
+
 [env]
-WINDIVERT_PATH = "C:/Users/MOSS/wdlib"
+# relative=true:路径以本文件所在目录(仓库根)为基准解析,与 cargo 在何处运行无关;
+# force=false:外部环境变量(如 CI)可覆盖。
+WINDIVERT_PATH = { value = "assets", relative = true, force = false }
