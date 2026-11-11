@@ -102,15 +102,6 @@ cargo build --release -p rl-app
 - 限速针对本机网卡带宽,局域网内网流量同样会被统计和限制(loopback 除外)
 - 驱动为 WinDivert 官方签名版本,Windows 11 24H2+ 的 HVCI/驱动签名策略变化可能导致加载失败(当前 26H2 实测正常)
 
-## CNB 构建与发布
-
-本仓库自带 [`.cnb.yml`](.cnb.yml),在 [cnb.cool](https://cnb.cool) 上 import 本仓库后即可:
-
-1. **云端构建**:在 `main` 分支 push 时自动触发 Windows Runner 上的 `cargo build --release`,产物 `FlowRule.exe` + WinDivert 运行时打包为 `FlowRule-windows-x64.zip`,以构建附件形式保留(90 天)。
-2. **打 tag 发 Release**:推送形如 `v0.1.0` 的 tag 时,自动构建并创建/更新对应版本的 Release,zip 作为 Release 资产发布。
-
-> 注意:`.cargo/config.toml` 中的 `WINDIVERT_PATH` 为本地开发路径;CNB 云端构建依赖仓库内 `assets/` 目录,如云端构建失败请检查 `.cnb.yml` 中的路径映射。
-
 ## English
 
 **FlowRule** is a per-process network bandwidth limiter for Windows, powered by WinDivert kernel-level packet capture and built with Rust + Tauri 2.
