@@ -236,7 +236,7 @@ try {
 # ---------------------------------------------------------------- 3. 打包 zip
 $ver = (Select-String -Path (Join-Path $asciiSrc 'Cargo.toml') -Pattern '^version\s*=\s*"([^"]+)"' |
     Select-Object -First 1).Matches[0].Groups[1].Value
-$zipName = "liulv-v$ver-win-x64.zip"
+$zipName = "FlowRule-v$ver-win-x64.zip"
 $zipPath = Join-Path $workspace $zipName
 if (Test-Path $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
 Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zipPath -Force
