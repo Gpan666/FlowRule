@@ -1,6 +1,9 @@
-Windows 单程序网络限速工具（Rust + Tauri + WinDivert）。
+FlowRule 1.0 —— 按进程限速的 Windows 网络带宽管理工具(WinDivert + Rust + Tauri)
 
-- 限速只作用于目标程序，不再整机被限
-- 自定义速率（如 20MB）真实按 20MB/s 生效
-- 引擎改用 WinDivertRecvEx 重叠 I/O + 合法 QUEUE_TIME(100ms)
-- 支持 IPv6 / QUIC 流量归属（IPv6 TCP 因 Windows API 限制暂归其他流量）
+- 全新 Throttle 架构引擎:flow-events / engine / drainer / aggregator 四线程,单 WinDivert 网络层句柄捕获 + 重注入
+- 进程表格实时速率,点击「下载 / 上传」列头按当前速率降序;每进程独立上下行限速与完全阻断
+- master 总开关一键停用全部限速;其他流量兜底限速;60 秒总速率曲线;引擎诊断栏
+- IPv6 TCP/UDP 归属完整支持;令牌桶 200ms 突发,限速约 0.2~0.5s 内压到位
+- 规则、总开关与兜底限制持久化于 %APPDATA%\rl-app\rules.json
+
+运行要求:管理员权限;FlowRule.exe 同目录需 WinDivert.dll / WinDivert64.sys / WebView2Loader.dll
