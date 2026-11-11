@@ -38,10 +38,19 @@ impl Direction {
     /// 进程归属改由引擎在用户态用五元组 + 系统连接表判定（见 rl-engine-win::proc_map）。
     ///
     /// `not impostor` 用于排除 WinDivertSend 重注入的包，避免自己捕获自己形成死循环。
+    ///
+    /// ⚠️ **必须是 `not ifIdx != 1`，不能是 `not loopback`。**
+    /// WinDivert 的 `loopback` 是「两端都是 127.0.0.1 / ::1」的应用层回环包；
+    /// 而 Windows 上几乎所有 VPN / 代理（Clash、v2rayN、WireGuard…）都在本机中转：
+    /// 流量经 Wintun / TAP 虚拟网卡进来，再在物理网卡出去 —— 这两段的中转包
+    /// 一端是 127.0.0.1 或虚拟网卡地址、另一端是正常地址，`loopback` 判定为 false，
+    /// 于是一份下载在 `ifIdx` 1→N、N→1 上各被我们限了一次，
+    /// **用户设 1 MB/s 实测卡在 500 KB/s 左右，看起来像「限速不准 / 不生效」**。
+    /// `ifIdx == 1` 是 Windows 的软件回环接口（本地回环路径），跳过它即「每个包只限一次」。
     pub fn base_filter(self) -> &'static str {
         match self {
-            Direction::Down => "inbound and (ip or ipv6) and (tcp or udp) and not loopback and not impostor",
-            Direction::Up => "outbound and (ip or ipv6) and (tcp or udp) and not loopback and not impostor",
+            Direction::Down => "inbound and (ip or ipv6) and (tcp or udp) and not ifIdx != 1 and not impostor",
+            Direction::Up => "outbound and (ip or ipv6) and (tcp or udp) and not ifIdx != 1 and not impostor",
         }
     }
 }
