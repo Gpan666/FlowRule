@@ -6,7 +6,7 @@
 #   3. git + tar（Windows 10/11 自带 bsdtar）。
 #   4. 在 CNB「tsbyj.666 / 组织设置 / 构建节点」接入该机器，标签至少包含 `windows`。
 #
-# 产物：rl-app.exe + WinDivert.dll/WinDivert64.sys/WebView2Loader.dll 打成 zip，
+# 产物：FlowRule.exe + WinDivert.dll/WinDivert64.sys/WebView2Loader.dll 打成 zip，
 #      由 tools/ci/upload-artifact.ps1 上传到 CNB。
 #
 # 注意：CNB 自托管 Windows 节点的 stage script 默认按 PowerShell 执行，
@@ -80,6 +80,32 @@ if ($LASTEXITCODE -ne 0) { throw "git archive 失败（exit $LASTEXITCODE）" }
 tar -xf $tarPath -C $asciiSrc
 Remove-Item -LiteralPath $tarPath -Force
 Write-Step "源码已导出到纯 ASCII 路径：$asciiSrc"
+
+# 0.25 WinDivert/WebView2 运行时文件：二进制不再入库（.gitignore 排除），
+#      缺失时自动从 GitHub Release 附件 zip 解出。可用 RUNTIME_ZIP_URL 覆盖来源。
+$assetsDir = Join-Path $asciiSrc 'assets'
+if (-not (Test-Path $assetsDir)) { New-Item -ItemType Directory -Force -Path $assetsDir | Out-Null }
+$runtimeFiles = @('WinDivert.dll', 'WinDivert64.sys', 'WebView2Loader.dll')
+$missing = @($runtimeFiles | Where-Object { -not (Test-Path (Join-Path $assetsDir $_)) })
+if ($missing.Count -gt 0) {
+    $runtimeUrl = if ($env:RUNTIME_ZIP_URL) { $env:RUNTIME_ZIP_URL } else { 'https://github.com/Gpan666/FlowRule/releases/download/v1.0.0/FlowRule-v1.0.0-win-x64.zip' }
+    Write-Step ("运行时文件缺失（" + ($missing -join ', ') + "），从 Release 下载：" + $runtimeUrl)
+    $rtZip = Join-Path $env:TEMP ('flowrule-runtime-' + $uniq + '.zip')
+    Invoke-WebRequest -Uri $runtimeUrl -OutFile $rtZip -UseBasicParsing
+    $rtDir = Join-Path $env:TEMP ('flowrule-runtime-' + $uniq)
+    if (Test-Path $rtDir) { Remove-Item $rtDir -Recurse -Force }
+    Expand-Archive -Path $rtZip -DestinationPath $rtDir -Force
+    foreach ($f in $runtimeFiles) {
+        $src = Join-Path $rtDir $f
+        if (Test-Path $src) { Copy-Item $src (Join-Path $assetsDir $f) -Force }
+    }
+    Remove-Item $rtZip -Force -ErrorAction SilentlyContinue
+    Remove-Item $rtDir -Recurse -Force -ErrorAction SilentlyContinue
+    foreach ($f in $runtimeFiles) {
+        if (-not (Test-Path (Join-Path $assetsDir $f))) { throw "Release zip 中未找到 $f" }
+    }
+    Write-Step '运行时文件已就绪'
+}
 
 # 0.3 Rust 工具链
 #     CNB 自托管 runner 常以 LocalSystem 账户运行，%USERPROFILE% 指向
@@ -199,22 +225,22 @@ try {
     & $cargoExe build --release --workspace
     if ($LASTEXITCODE -ne 0) { throw "cargo build 失败（exit $LASTEXITCODE）" }
 
-    $exe = Join-Path $targetDir 'release\rl-app.exe'
+    $exe = Join-Path $targetDir 'release\FlowRule.exe'
     if (-not (Test-Path $exe)) { throw "未找到构建产物：$exe" }
-    Write-Step ("rl-app.exe 大小: " + (Get-Item $exe).Length + " 字节")
+    Write-Step ("FlowRule.exe 大小: " + (Get-Item $exe).Length + " 字节")
 } finally {
     Pop-Location
 }
 
 # ---------------------------------------------------------------- 2. 收集运行时文件
-# 在 %TEMP% 下的独立暂存目录组装，避免工作区里的 dist\rl-app.exe 正被运行中的
+# 在 %TEMP% 下的独立暂存目录组装，避免工作区里的 dist\FlowRule.exe 正被运行中的
 # 程序占用（Copy-Item 会因文件锁直接失败），也避免污染仓库工作区。
 $stage = Join-Path $env:TEMP ('liulv-stage-' + $uniq)
 if (Test-Path $stage) {
     Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
 }
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
-Copy-Item -LiteralPath $exe -Destination (Join-Path $stage 'rl-app.exe') -Force
+Copy-Item -LiteralPath $exe -Destination (Join-Path $stage 'FlowRule.exe') -Force
 
 foreach ($f in @('WinDivert.dll', 'WinDivert64.sys', 'WebView2Loader.dll')) {
     $src = Join-Path $asciiSrc ("assets\" + $f)

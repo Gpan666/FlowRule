@@ -56,8 +56,11 @@ FlowRule/
 │   │   └── frontend/    # 内嵌 HTML/CSS/JS 界面(无 npm 依赖)
 │   └── rl-engine/       # 限速引擎核心
 │       └── src/backend/ # engine / flows / sockets / rules / synthetic
-├── assets/              # WinDivert 驱动与库文件
-├── .cargo/config.toml   # 构建配置(WINDIVERT_PATH)
+├── assets/              # 图标资源;WinDivert/WebView2 二进制不入库(CI 自动下载)
+├── tools/
+│   ├── ci/              # CNB 流水线脚本(构建/打包/上传 Release)
+│   └── scripts/         # 本地诊断与验证脚本
+├── .cargo/config.toml   # 构建配置
 └── Cargo.toml           # workspace 根
 ```
 
@@ -69,7 +72,7 @@ FlowRule/
 - [Rust 工具链](https://rustup.rs/)(stable)
 - Visual Studio Build Tools(C++ 桌面开发,用于链接)
 - [Tauri 2 依赖](https://tauri.app/start/prerequisites/)(WebView2 运行时,Win11 自带)
-- WinDivert 2.2.2-A 开发文件(`WinDivert.lib` / `WinDivert.dll` / `WinDivert64.sys`),放在任意目录并在 `.cargo/config.toml` 的 `WINDIVERT_PATH` 中指向它
+- WinDivert 2.2.2-A 运行时(`WinDivert.dll` / `WinDivert64.sys`)与 `WebView2Loader.dll`,放到 `assets/` 目录(二进制不入库;CI 构建时脚本会自动从 Release 下载,本地开发手动放置一次即可)
 
 ### 编译
 
