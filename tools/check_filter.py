@@ -78,10 +78,21 @@ def main():
     else:
         print("[PASS] WINDIVERT_ADDRESS = 80 字节")
 
+    # 3.5) 静态防线：base_filter 不得按网卡过滤
+    for name, f in base_filters:
+        for tok in ("ifIdx", "loopback"):
+            if tok in f:
+                failures.append(f"base_filter({name}) 含网卡条件 {tok}：{f}")
+    if not any("ifIdx" in f or "loopback" in f for _, f in base_filters):
+        print("[PASS] base_filter 不含任何网卡条件（跨网卡去重改由用户态保证）")
+
     # 4) 反例自检：确认 DLL 确实会拒绝 processId（保证这个校验有判别力）
-    #    注意：这里的「合法部分」必须用引擎当前真实的 filter 语义（not ifIdx != 1），
-    #    否则反例可能因为别的语法问题被拒绝，看不出 processId 本身非法。
-    bad = "inbound and (ip or ipv6) and (tcp or udp) and not ifIdx != 1 and (processId == 4242)"
+    #    注意：这里的「合法部分」必须用引擎当前真实的 filter 语义，否则反例可能
+    #    因为别的语法问题被拒绝，看不出 processId 本身非法。
+    #    ⚠️ filter 里**不许再出现任何网卡条件**（ifIdx / loopback）：按网卡猜一次，
+    #       猜错的方向就是「流量根本不进句柄」，比限多限少严重得多。
+    #       同一个包跨网卡只限一次，改由引擎在用户态按包内 IP 去重（见 Dedupe）。
+    bad = "inbound and (ip or ipv6) and (tcp or udp) and not impostor and (processId == 4242)"
     ok, msg, pos = compile_ok(bad)
     if ok:
         failures.append("反例自检失败：含 processId 的 filter 竟然编译通过，校验失去意义")

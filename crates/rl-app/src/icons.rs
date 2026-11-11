@@ -14,8 +14,11 @@
 // Windows 的 Shell / GDI 类型与常量，非 Windows 上无人使用
 #![allow(dead_code)]
 
+#[cfg(windows)]
 use std::ffi::OsStr;
+#[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
 use std::{mem, path::Path};
 
 const SHGFI_ICON: u32 = 0x0000_0100;

@@ -838,3 +838,59 @@ OK   processId == 4242                layer=2 (FLOW) 才通过
 - `cargo test -p rl-engine-win --test logic`：**21 项全绿**（Linux 上直接跑）。
 - `cargo check/build -p rl-app --target x86_64-pc-windows-gnu`：通过（Windows 目标编译无误）。
 - 仍未在真机上实测降速速率（本机无 Windows 环境），**这一项要靠用户装新 exe 复验**。
+
+## 18. 第五轮「限 Starward.exe 5 MB/s 不生效」：filter 把真正的流量丢在了门外（2026-11-11）
+
+用户的现场诊断行（截图）是**决定性证据**：
+
+```
+句柄 2/2 · 桶 1 · 收包 194 · 命中限速 0 · 丢弃 0 · 程序识别 0 · 连接表 TCP 580/UDP 18 · v6 0/22
+生效桶：starward.exe 下行 = 5 MB/s
+```
+
+桶建好了、句柄也开了，但**收包只有 194 个**（几次握手就没了）、程序识别 0、命中 0、丢弃 0，
+下载却跑满带宽。这不是「限得不准」，而是**流量根本没进句柄**。
+
+### 18.1 根因：`not ifIdx != 1` 把虚拟网卡上的进程流量全丢了
+第四节把 filter 从 `not loopback` 改成 `not ifIdx != 1`（= 只要物理网卡、丢掉软件回环口），
+用来修「VPN 环境下同一个包被限两次、实测只有设定值一半」。这个修法本身是对的，
+但它**假设了进程的真实流量一定走物理网卡**——在有 VPN / 代理 / 虚拟网卡的机器上不成立：
+进程的流量全在虚拟网卡（Wintun / TAP）上，filter 直接把它丢掉，
+句柄只剩隧道外层那点加密流量，外层又归属不到进程。
+→ 收包极小、识别 0、命中 0、丢弃 0，下载满速。
+
+**教训（与 15.1 同类）**：filter 里按网卡做任何假设，猜错时不是「限多限少」，
+而是「完全不限」。**「同一个包只限一次」与「必须看到所有包」是两件事，必须分开处理。**
+
+### 18.2 修复 A：filter 只看方向 / 协议，网卡判断交给用户态
+- `base_filter` → `inbound|outbound and (ip or ipv6) and (tcp or udp) and not impostor`。
+- 新增 `Dedupe`：按**包内识别码**（IPv4 identification + 协议号、IPv6 流标签）做 200ms 窗口去重，
+  上下行各一套。跨网卡 / 双向捕获的重复副本**直接放行、不重复扣令牌**，
+  既回到「每个包只限一次」，又不会像 ifIdx 那样把整条路径漏掉。
+- 新增回归：`base_filter_never_filters_by_interface`（含 ifIdx/loopback 即失败）、
+  `duplicate_copy_is_counted_once`、`different_packets_are_not_deduped`、
+  `ipv6_dedupe_uses_flow_label`；`tools/check_filter.py` 反例自检同步更新并加静态检查。
+
+### 18.3 修复 B：限速注定不生效时必须说出来，不能静默
+新增「未识别流量」计数：既没进任何桶、也没认出程序的字节数连续累积超过 256KB，
+且当前存在程序级规则 → `warning` 明确告知「这些流量归属识别失败，程序限速不会生效」；
+一旦有流量成功归属即清零作废。诊断行新增 `去重` 计数，说明哪些字节是副本被跳过。
+
+### 18.4 顺带修掉两处会让引擎「自己把自己卡住」的隐患
+- `recv` 等待超时后不再无条件一直 pending：先 `GetOverlappedResult` 查一次
+  （包可能在「事件置位」与「清除」之间到达，事件被消费掉但请求已完成），
+  仍未完成才继续等 —— 否则该方向会永久收不到包。
+- 重注入失败后 `break` 而不是 `continue`：同轮重试只会拿到同一个包，白白耗尽预算。
+- 空转时后台线程睡 2ms（有包时仍 1ms）：`poll` 本身不阻塞，
+  不能靠「无限阻塞在 recv 上」让出 CPU，那会连带卡死进程扫描、采样与补桶。
+
+### 18.5 让 `cargo test` 在本机也能跑全
+`icons.rs` 的 Windows-only import 加了 `#[cfg(windows)]`，
+`DirHandle::drop` 里的 `CloseHandle` 在非 Windows 上跳过 —— 之前 `rl-app` 单测在
+Linux 上根本编译不过，等于 CI 里最关键的一层回归是空的。
+
+### 18.6 验证
+- `cargo test -p rl-core` 27 项、`cargo test -p rl-engine-win --test logic` 25 项、
+  `cargo test -p rl-app` 14 项全绿（Linux 上直接跑）。
+- 真机降速仍需用户装新 exe 复验；复验时看诊断行：`收包` 应随下载飞快增长，
+  `程序识别` / `命中限速` 应在涨，`丢弃` 在涨即限速生效。
