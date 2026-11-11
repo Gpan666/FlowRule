@@ -102,6 +102,12 @@ cargo build --release -p rl-app
 - 限速针对本机网卡带宽,局域网内网流量同样会被统计和限制(loopback 除外)
 - 驱动为 WinDivert 官方签名版本,Windows 11 24H2+ 的 HVCI/驱动签名策略变化可能导致加载失败(当前 26H2 实测正常)
 
+## 贡献者
+
+<a href="https://github.com/Gpan666"><img src="https://img.shields.io/badge/TSBYJ-作者-3482FF?style=flat-square" alt="TSBYJ"></a>
+<a href="https://www.trae.cn"><img src="https://img.shields.io/badge/TRAE-AI%20IDE-6E56CF?style=flat-square" alt="TRAE"></a>
+<a href="https://www.trae.cn"><img src="https://img.shields.io/badge/WorkBuddy-AI%20助手-00B3A7?style=flat-square" alt="WorkBuddy"></a>
+
 ## English
 
 **FlowRule** is a per-process network bandwidth limiter for Windows, powered by WinDivert kernel-level packet capture and built with Rust + Tauri 2.
