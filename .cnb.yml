@@ -1,7 +1,7 @@
-# CNB 云原生构建流水线 —— 流律（liulv-ratelimiter）
+# CNB 云原生构建流水线 —— FlowRule
 #
-# 目标：合并到 main 后自动在 Windows 上编译出 rl-app.exe，并作为「提交附件」可下载；
-#       推送 v* Tag 时额外创建 Release 并附上 zip。
+# 目标：仅在推送 v* 版本 Tag 时自动构建并创建/更新 Release（附 zip）。
+#       普通代码/文档改动（push main、PR 合并）不再触发构建。
 #
 # ── 为什么用自托管 Windows 节点 ──────────────────────────────────────────────
 #   本项目是 Windows 桌面程序（Tauri + WebView2 + WinDivert 驱动），
@@ -17,47 +17,16 @@
 #   4. 机器能访问 cnb.cool 与 crates.io
 #
 # ── 产物去向 ────────────────────────────────────────────────────────────────
-#   push / pull_request.merged → 上传为「提交附件」，在提交页与仓库页直接下载
-#   v* Tag                    → 额外创建 Release 并挂 zip 附件
+#   v* Tag push → 构建 Release 版 exe，打包 zip 创建/更新对应版本的 Release
+#
+# 发版流程：改代码 → 合并到 main → 更新 Cargo.toml/tauri.conf.json 版本号 →
+#           git tag vX.Y.Z && git push cnb vX.Y.Z 即自动出 Release。
 #
 # 注意：CNB 自托管 Windows 节点的 stage script 默认按 PowerShell 执行，
 #       因此所有命令都写成 PowerShell 语法；且自托管节点不启用 Docker，
 #       上传附件走 CNB OpenAPI（tools/ci/upload-artifact.ps1）而非 attachments 插件。
 
-main:
-  # ── PR 合并进 main 后构建 ────────────────────────────────────────────────
-  pull_request.merged:
-    - name: build-and-upload-asset
-      runner:
-        namespace: group
-        tags:
-          - windows
-      stages:
-        - name: build
-          script: |
-            & "$env:CNB_BUILD_WORKSPACE\tools\ci\build-win.ps1"
-
-        - name: upload commit asset
-          script: |
-            & "$env:CNB_BUILD_WORKSPACE\tools\ci\upload-artifact.ps1" -Mode commit
-
-  # ── 直接推 main 也构建一次 ───────────────────────────────────────────────
-  push:
-    - name: build-and-upload-asset
-      runner:
-        namespace: group
-        tags:
-          - windows
-      stages:
-        - name: build
-          script: |
-            & "$env:CNB_BUILD_WORKSPACE\tools\ci\build-win.ps1"
-
-        - name: upload commit asset
-          script: |
-            & "$env:CNB_BUILD_WORKSPACE\tools\ci\upload-artifact.ps1" -Mode commit
-
-# ── 推 v* Tag：构建 + 建 Release ───────────────────────────────────────────
+# ── 仅 v* Tag 触发构建 + 发 Release ─────────────────────────────────────────
 # 注意：tag_push 的 glob 模式（v*）是**顶层键**，不能嵌在 $ 下面。
 #       （$ 只是「未被 glob 匹配时的兜底」，嵌套写法不会被解析。）
 #       tag_push 事件里 tag 名存放在 CNB_BRANCH，而不是 CNB_TAG。
@@ -76,3 +45,11 @@ v*:
         - name: create release and upload asset
           script: |
             & "$env:CNB_BUILD_WORKSPACE\tools\ci\upload-artifact.ps1" -Mode release
+
+# ── 其他事件：不构建 ─────────────────────────────────────────────────────────
+$:
+  - name: noop
+    stages:
+      - name: skip
+        script: |
+          Write-Host "非版本 Tag 推送，跳过构建（仅 v* Tag 触发 Release 构建）"
